@@ -7,10 +7,11 @@ from shardstore import common
 
 
 class StoreError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, detail=None):
         super().__init__(f"[{code}] {message}")
         self.code = code
         self.message = message
+        self.detail = detail or {}
 
 
 class Row:
@@ -45,6 +46,70 @@ class ScanPage:
         self.rows = rows
         self.next_cursor = next_cursor
         self.done = done
+
+
+class Change:
+    """One committed write, delivered whole.
+
+    `commit_seq` is the global commit sequence; `ops` is the original caller
+    request in caller order (put/delete including deletes of missing keys),
+    already decoded to the same tuples `write()` accepts.  `watermark` is the
+    stable logical position of the request in the stream and `size_bytes` is
+    the canonical payload size.  A commit is never split across deliveries:
+    a single commit above the byte budget is still delivered in one piece and
+    flagged with `over_budget=True`."""
+    __slots__ = ("commit_seq", "request_id", "epoch", "watermark", "ops",
+                 "size_bytes", "over_budget")
+
+    def __init__(self, commit_seq, request_id, epoch, watermark, ops,
+                 size_bytes, over_budget):
+        self.commit_seq = commit_seq
+        self.request_id = request_id
+        self.epoch = epoch
+        self.watermark = watermark
+        self.ops = ops
+        self.size_bytes = size_bytes
+        self.over_budget = over_budget
+
+    def __eq__(self, other):
+        return isinstance(other, Change) and (
+            self.commit_seq, self.request_id, self.epoch, self.watermark,
+            self.ops, self.size_bytes) == (
+            other.commit_seq, other.request_id, other.epoch, other.watermark,
+            other.ops, other.size_bytes)
+
+    def __repr__(self):
+        return (f"Change(seq={self.commit_seq}, request_id={self.request_id!r},"
+                f" ops={self.ops!r})")
+
+
+class PullPage:
+    """The result of a pull/replay.  Iterate it directly for the commits."""
+    __slots__ = ("changes", "state", "next_after", "has_more", "bytes",
+                 "over_budget", "oversize_seq")
+
+    def __init__(self, r):
+        self.changes = [Change(c["commit_seq"], c["request_id"], c["epoch"],
+                               c.get("watermark"),
+                               [common.op_from_wire(o) for o in c["ops"]],
+                               c["size_bytes"], c["over_budget"])
+                        for c in r.get("items", [])]
+        self.state = r
+        self.next_after = r["next_after"]
+        self.has_more = r["has_more"]
+        self.bytes = r.get("bytes", 0)
+        self.over_budget = r.get("over_budget", False)
+        self.oversize_seq = r.get("oversize_seq")
+
+    def __iter__(self):
+        return iter(self.changes)
+
+    def __len__(self):
+        return len(self.changes)
+
+    def __repr__(self):
+        return (f"PullPage({len(self.changes)} commits, next_after="
+                f"{self.next_after}, has_more={self.has_more})")
 
 
 def put(tenant, key, text=None, integer=None, blob=None):
@@ -102,7 +167,8 @@ class Store:
             s.close()
         if not resp.get("ok"):
             err = resp.get("error") or {}
-            raise StoreError(err.get("code", "INTERNAL"), err.get("message", ""))
+            raise StoreError(err.get("code", "INTERNAL"), err.get("message", ""),
+                             err.get("detail"))
         return resp.get("result")
 
     # ---------------------------------------------------------- writes
@@ -151,6 +217,70 @@ class Store:
 
     def release(self, token):
         return self._rpc("release", token=token.token_id)
+
+    # ---------------------------------------------------------- subscriptions
+    def subscribe(self, name, after_seq):
+        """Register a named subscription that starts after committed seq
+        `after_seq` (strictly: the first delivered commit is after_seq + 1).
+
+        A new name gets generation 1.  Re-registering the same name with the
+        same after_seq keeps the cursor and confirmed prefix but takes a new
+        consumption generation (older generations are rejected).  A different
+        after_seq raises SUBSCRIPTION_EXISTS -- progress is never silently
+        reset.  The returned `generation` is what pull/ack need."""
+        return self._rpc("subscribe", name=name, after_seq=int(after_seq))
+
+    def claim(self, name):
+        """Take over consumption of `name`, invalidating every older
+        generation: their delayed acks/pulls are rejected.  The cursor and
+        confirmed prefix are kept."""
+        return self._rpc("claim", name=name)
+
+    def pull(self, name, generation, max_commits=100, max_bytes=1 << 20):
+        """Fetch up to max_commits commits / max_bytes of changes, in strictly
+        increasing commit_seq order, starting after the confirmed prefix.
+        A single commit above max_bytes is delivered whole and flagged."""
+        return PullPage(self._rpc("pull", name=name, generation=generation,
+                                  max_commits=int(max_commits),
+                                  max_bytes=int(max_bytes)))
+
+    def ack(self, name, generation, through_seq):
+        """Confirm that the contiguous prefix through `through_seq` has been
+        fully processed.  Retries are idempotent; backwards or non-contiguous
+        acknowledgements are refused without moving the cursor."""
+        return self._rpc("ack", name=name, generation=generation,
+                         through_seq=int(through_seq))
+
+    def pause(self, name, generation):
+        return self._rpc("set_paused", name=name, paused=True,
+                         generation=generation)
+
+    def resume(self, name, generation):
+        return self._rpc("set_paused", name=name, paused=False,
+                         generation=generation)
+
+    def replay(self, name, generation, after_seq, max_commits=100,
+               max_bytes=1 << 20):
+        """Re-deliver already delivered commits from a retained position.
+        Never moves the cursor; refuses positions before the retained range
+        (with the usable range) or beyond what was delivered."""
+        return PullPage(self._rpc("replay", name=name, generation=generation,
+                                  after_seq=int(after_seq),
+                                  max_commits=int(max_commits),
+                                  max_bytes=int(max_bytes)))
+
+    def subscribe_status(self, name):
+        return self._rpc("subscription_status", name=name)
+
+    def subscriptions(self):
+        return self._rpc("subscriptions")
+
+    def cleanup(self, up_to):
+        """Release subscription change payloads through commit seq `up_to`.
+        Refuses to pass an unconfirmed subscriber or crash-recovery need;
+        request_id dedup receipts are kept, so retransmissions still return
+        the original receipt."""
+        return self._rpc("cleanup", up_to=int(up_to))
 
     # ---------------------------------------------------------- admin
     def split(self, shard_id, boundary):

@@ -19,8 +19,8 @@
 
 ```
 <dir>/
-  control.sqlite     路由纪元、提交决定日志（含载荷，恢复依据）、读令牌、
-                     split 状态机
+  control.sqlite     路由纪元、提交决定日志（含变更载荷：既是恢复依据
+                     也是变更订阅日志）、订阅游标/世代、读令牌、split 状态机
   shards/<id>.db     每个分片一个文件：kv(tenant,k,seq,op,vt,vi,vb) +
                      frontier(已应用提交前沿)
 ```
@@ -47,6 +47,89 @@ seq + 一个完整路由代号）。`get` / `scan` 都按该读取点由对应�
 scan 按键全序、不重不漏、可分页，翻页沿用同一读取点。令牌必须显式
 `release`——服务不用超时猜测读者是否还在。NULL / int64 / BLOB 类型在
 结果中精确保留（线协议里 int64 走十进制字符串、BLOB 走 base64）。
+
+## 持久化变更订阅
+
+提交决定记录同时就是**变更日志**：每个 `write` 的载荷（调用者原样
+put/delete 序列、请求 ID、提交序号）在 `commits.deliver_json`
+持久落盘，与行数据同库同事务，不复制到另一套不受保留规则约束的数据库。
+下游按全局 `commit_seq` 递增消费。
+
+### 注册与消费世代
+
+```python
+sub = s.subscribe("etl-a", after_seq=0)   # 从 0 号提交之后开始
+gen = sub["generation"]                    # 消费世代（新名称从 1 开始）
+```
+
+- 名称稳定；同名以**不同** `after_seq` 再次注册 → `SUBSCRIPTION_EXISTS`，
+  绝不悄悄重置进度。同名同 `after_seq` 再次注册是进程重连：游标与已确认
+  前缀保留，但启动**新的消费世代**（旧世代立即失效，见 `s.claim(name)` 可
+  单独接管）。
+- 一个订阅可被多个进程访问，但任何时刻只有一个有效世代：旧世代的
+  `pull`/`ack`/`replay` 一律 `STALE_GENERATION`，不能推进游标。
+- 订阅位置、可交付范围、积压量：
+  `s.subscribe_status(name)`、`s.subscriptions()`。
+
+### 拉取（交付单元）
+
+```python
+page = s.pull(name, gen, max_commits=100, max_bytes=1 << 20)
+for ch in page:                  # ch.commit_seq / request_id / ops / size_bytes
+    handle(ch.ops)               # ops 即原始调用序列（可直接再传给 write）
+s.ack(name, gen, page.next_after)
+```
+
+- 结果按 `commit_seq` **严格递增**；每个 `commit_seq` 是一个**不可拆分**
+  的交付单元，保留原 `request_id`、提交序号与调用者操作次序（含重复键
+  put、delete 及对不存在键的 delete）。多个提交绝不合并成一个无法还原
+  边界的结果。
+- 只有**已完整应用**（`applied=1`）的提交可交付；已决定但未应用/部分应用
+  的提交不会出现在结果中。
+- `max_commits` / `max_bytes` 只在单元之间截断；**单个提交超出字节预算
+  仍整体交付**，并以 `page.over_budget`、`page.oversize_seq` 和该单元的
+  `over_budget` 明确标出。
+- 拉取与确认分离，且**拉取自身不移动游标**：交付总是从已确认前缀
+  重新开始，因此同一确认状态下的重复拉取返回**逐字节相同**的提交序列与
+  `size_bytes`（无论客户端是否重连）。
+- `s.pause(name, gen)` / `s.resume(name, gen)`：暂停时返回空页且不推进
+  任何游标；暂停状态落盘，重启后保持。
+
+### 确认
+
+`s.ack(name, gen, through_seq)` 确认**连续已交付前缀**：
+
+- 重复确认幂等（同值成功），不连续/越过已交付范围 → `BAD_ACK`，
+  回退确认 → `BAD_ACK`；被拒绝的确认不改变进度。
+- 客户端/服务重启后游标来自持久状态；服务在确认期间被强制结束不会出现
+  半推进。
+
+### 重放
+
+`s.replay(name, gen, after_seq, ...)` 从保留范围内已交付的位置重新投递
+（不移动游标）。早于实际保留下界、或越过已交付范围的请求 → `OUT_OF_RANGE`，
+错误 `detail` 中报告 `min_after` / `max_after` / `log_low` / `log_high`，
+绝不静默从较新位置开始。
+
+### 日志清理
+
+`s.cleanup(up_to)` 释放 `<= up_to` 的变更载荷（行版本 GC 合约不在此列）：
+
+- 上界不能越过**任何未确认订阅**仍需要的提交（`acked_seq < up_to` 的
+  订阅即阻断），也不能越过未应用的恢复记录；否则 `CLEANUP_BLOCKED`，
+  `detail.safe_up_to` 给出安全上界，`detail.blocked_by` 指出阻断者。
+  快订阅不会被慢订阅拖住，只要慢订阅的未确认前缀之上不清理即可。
+- 载荷释放与保留区间移动在**同一个控制事务**中；崩溃只可能看到完整的
+  旧区间或完整的新区间，不会出现部分可见的边界。
+- 清理不影响提交恢复、活跃读取，也不影响 `request_id` 去重回执
+  （`receipt_json` 单独保留）：相同 ID 同内容重传仍返回原回执，不重执行；
+  冲突内容仍 `CONFLICT`。
+- 新订阅或重放的 `after_seq` 早于实际保留下界 → `OUT_OF_RANGE` 并报告
+  可用范围。无订阅者时，上界仍由保留载荷决定，含义稳定：空日志的
+  `min_after` = 已提交末尾。
+
+所有订阅元数据（原点、已确认前缀、已交付上界、世代、暂停位）与变更载荷
+都在控制库中；重启后一致。
 
 ## 在线 split
 
@@ -79,6 +162,11 @@ python3 acceptance.py            # 约 1 分钟
 SCALE_ROWS=200000 python3 acceptance.py   # 更大规模
 ONLY="main drill" python3 acceptance.py   # 只跑某个阶段
 KEEP=1 python3 acceptance.py     # 保留工作目录便于检查
+
+# 变更订阅验收（独立提交模型、多进程、崩溃/清理边界）
+python3 subscription_acceptance.py
+SUB_BACKLOG=2000 python3 subscription_acceptance.py
+ONLY="cleanup and receipts" python3 subscription_acceptance.py
 ```
 
 ## 客户端 API 摘要
@@ -97,12 +185,25 @@ s.release(tok)
 s.split("s1", ("t", 4))                             # 在线分裂
 s.migration_status()                                # 迁移阶段 + 各片前沿
 s.routing(); s.reclaim()
+
+# 变更订阅
+sub = s.subscribe("etl-a", after_seq=0)             # {"generation": 1, ...}
+gen = sub["generation"]
+p = s.pull("etl-a", gen, max_commits=100, max_bytes=1 << 20)
+for ch in p:                                        # ch.commit_seq/request_id/ops
+    consume(ch.ops)
+s.ack("etl-a", gen, p.next_after)                   # 连续已处理前缀
+s.pause("etl-a", gen); s.resume("etl-a", gen)
+r = s.replay("etl-a", gen, after_seq=41)            # 保留范围内重放，不动游标
+s.claim("etl-a")                                    # 新消费世代，旧世代作废
+s.subscribe_status("etl-a"); s.subscriptions()
+s.cleanup(100)                                      # 释放载荷，绝不越过未确认前缀
 ```
 
 测试钩子（验收脚本使用）：`pause_copy(on)` 暂停/恢复拷贝线程（同步点），
 `arm_crash(point)` 在指定阶段点强制退出（`after_decision`、`during_copy`、
 `after_copy`、`after_catchup`、`before_publish`、`after_publish`、
-`during_reclaim`）。
+`during_reclaim`、`during_pull`、`during_ack`、`during_cleanup`）。
 
 ## 验收覆盖
 
@@ -114,3 +215,12 @@ s.routing(); s.reclaim()
 request_id、跨片事务、活跃旧令牌阻止回收、release 后可回收、两个迁移
 请求竞争（恰一个胜出）、10 万行运行时生成数据的大范围复制有界内存
 （RSS 采样）与多进程并发读者。
+
+`subscription_acceptance.py` 用**独立的提交模型**（有序的
+`(request_id, 原始 ops)` 列表，不调用被测订阅/清理实现）核对：交付单元
+边界与操作次序、重复键与不存在键删除、重试逐字节一致、计数/字节预算与
+超预算单提交、世代切换与旧世代确认无效、慢订阅阻止越界清理而快订阅不受
+阻、清理后 request_id 回执与冲突、过期重放明确失败、空流/有符号边界键/
+NULL/BLOB、拉取/确认/清理期间强制结束并重开、多进程争用同一订阅、
+迁移期间的新提交、大积压分页的有界内存。
+

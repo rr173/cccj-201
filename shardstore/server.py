@@ -61,8 +61,19 @@ CREATE TABLE IF NOT EXISTS commits (
   receipt_json TEXT NOT NULL,
   apply_json TEXT NOT NULL,
   bump_json TEXT NOT NULL,
-  applied INTEGER NOT NULL DEFAULT 0
+  applied INTEGER NOT NULL DEFAULT 0,
+  deliver_json TEXT,
+  payload_live INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS subscriptions (
+  name TEXT PRIMARY KEY,
+  origin_seq INTEGER NOT NULL,
+  acked_seq INTEGER NOT NULL,
+  delivered_seq INTEGER NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 1,
+  paused INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS epochs (
   epoch INTEGER NOT NULL,
   shard_id TEXT NOT NULL,
@@ -118,16 +129,20 @@ CRASH_POINTS = {
     "before_publish",   # split: inside the barrier, just before the publish tx
     "after_publish",    # split: just after the publish tx commits
     "during_reclaim",   # reclaim: after marking RECLAIMING, before file delete
+    "during_pull",      # subscription: after the delivery cursor advanced
+    "during_ack",       # subscription: after writing the confirmed prefix
+    "during_cleanup",   # subscription log: after the boundary check, before GC
 }
 
 ACTIVE_SPLIT_PHASES = ("COPYING", "CATCHING_UP")
 
 
 class StoreError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, detail=None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.detail = detail
 
 
 def _max_bound(a, b):
@@ -215,9 +230,468 @@ class Server:
                 c.execute("INSERT INTO shards(shard_id,state) VALUES ('s1','active')")
                 c.execute("INSERT INTO epochs(epoch,shard_id,lo_t,lo_k,hi_t,hi_k)"
                           " VALUES (1,'s1',NULL,NULL,NULL,NULL)")
+            c.execute("PRAGMA journal_mode=WAL")
+            cols = {r[1] for r in c.execute("PRAGMA table_info(commits)").fetchall()}
+            if "deliver_json" not in cols:
+                c.execute("ALTER TABLE commits ADD COLUMN deliver_json TEXT")
+            if "payload_live" not in cols:
+                c.execute("ALTER TABLE commits ADD COLUMN payload_live"
+                          " INTEGER NOT NULL DEFAULT 1")
+                # commits from an older build never had a change payload;
+                # they are outside the deliverable range, not a hole in it
+                c.execute("UPDATE commits SET payload_live=0"
+                          " WHERE deliver_json IS NULL")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_commits_live"
+                      " ON commits(payload_live, seq)")
+            c.execute("CREATE INDEX IF NOT EXISTS ix_commits_applied"
+                      " ON commits(applied)")
             c.commit()
         finally:
             c.close()
+
+    # ------------------------------------------------------ subscription log
+    # The retained change log is the set of commits with payload_live=1.
+    # Its lower bound is derived from that set, never stored separately, so a
+    # cleanup can never leave a partially visible range: payload release and
+    # retained-range movement are the same transaction.
+    def _log_floor(self, c):
+        """First seq that must still be deliverable from the retained log."""
+        row = c.execute("SELECT MIN(seq) FROM commits WHERE payload_live=1").fetchone()
+        if row is not None and row[0] is not None:
+            return int(row[0])
+        # empty log: anything after the committed end is a stable position
+        row = c.execute("SELECT MAX(seq) FROM commits").fetchone()
+        high = 0 if row is None or row[0] is None else int(row[0])
+        return max(self._meta_int(c, "visible_seq"), high) + 1
+
+    @staticmethod
+    def _write_watermark(request_id):
+        """Stable logical position of a request inside the change stream
+        (request_id dedup makes it unique)."""
+        return "r:" + request_id
+
+    def _deliver_view(self, c, seq):
+        """The stored change payload of commit `seq`, or None if it is no
+        longer retained.  Only fully applied commits are ever deliverable:
+        a decided-but-unapplied commit is never handed to a subscriber."""
+        row = c.execute(
+            "SELECT deliver_json, payload_live, applied FROM commits WHERE seq=?",
+            (seq,)).fetchone()
+        if row is None or not row[1] or row[0] is None:
+            return None
+        if not row[2]:
+            raise StoreError(
+                "INTERNAL",
+                f"commit {seq} is decided but not yet applied; it must not be"
+                f" delivered")
+        return json.loads(row[0])
+
+    def _payload_size(self, view):
+        canon = json.dumps(view, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False)
+        return len(canon.encode("utf-8")), canon
+
+    def _collect_changes(self, c, start_after, stop_at, max_commits, max_bytes):
+        """Ordered, non-splittable commits from `start_after`+1 through
+        `stop_at`.  A single commit bigger than max_bytes is returned whole
+        and flagged; no commit is ever cut into pieces or merged with
+        another."""
+        items = []
+        used = 0
+        over_budget = False
+        oversize_seq = None
+        seq = start_after + 1
+        while seq <= stop_at:
+            if len(items) >= max_commits:
+                break
+            view = self._deliver_view(c, seq)
+            if view is None:
+                floor = self._log_floor(c)
+                raise StoreError(
+                    "OUT_OF_RANGE",
+                    f"change payload for commit {seq} is no longer retained"
+                    f" (retained log starts at {floor})",
+                    {"log_low": floor, "log_high": self._meta_int(c, "visible_seq"),
+                     "min_after": floor - 1})
+            size, _ = self._payload_size(view)
+            if items and used + size > max_bytes:
+                break
+            oversized = size > max_bytes
+            if not items and oversized:
+                over_budget = True
+                oversize_seq = seq
+            items.append({
+                "commit_seq": seq,
+                "request_id": view["request_id"],
+                "epoch": view["epoch"],
+                "watermark": view.get("watermark"),
+                "ops": view["ops"],
+                "size_bytes": size,
+                "over_budget": oversized,
+            })
+            used += size
+            seq += 1
+        last = start_after if not items else items[-1]["commit_seq"]
+        return items, used, over_budget, oversize_seq, last
+
+    def _stream_bounds(self, c):
+        """(min_after, max_after) that a new subscription or replay may name."""
+        return (self._log_floor(c) - 1, self._meta_int(c, "visible_seq"))
+
+    def _subscription_row(self, c, name):
+        return c.execute(
+            "SELECT origin_seq, acked_seq, delivered_seq, generation, paused"
+            " FROM subscriptions WHERE name=?", (name,)).fetchone()
+
+    def _sub_state(self, c, name, row=None):
+        if row is None:
+            row = self._subscription_row(c, name)
+        if row is None:
+            raise StoreError("NO_SUBSCRIPTION", f"unknown subscription {name!r}")
+        origin, acked, delivered, generation, paused = row
+        visible = self._meta_int(c, "visible_seq")
+        log_low = self._log_floor(c)
+        return {
+            "name": name, "origin_seq": origin, "acked_seq": acked,
+            "delivered_seq": delivered, "generation": generation,
+            "paused": bool(paused),
+            "log_low": log_low, "log_high": visible,
+            "min_after": log_low - 1, "max_after": visible,
+            "backlog_commits": max(0, delivered - acked),
+            "available_commits": max(0, visible - acked),
+            "deliverable_after": acked,
+            "replay_after_min": max(origin, log_low - 1),
+            "replay_after_max": delivered,
+        }
+
+    # ------------------------------------------------------ subscriptions
+    def handle_subscribe(self, name, after_seq):
+        """Register a subscription starting strictly after committed seq
+        `after_seq`, then take its consumption generation.
+
+        Registration is how a process announces itself.  A new name gets
+        generation 1.  An existing name with a different after_seq is
+        refused: progress is never silently rewound.  An existing name with
+        the same after_seq keeps its cursor and confirmed prefix, but a new
+        process taking over starts a new generation, so a delayed ack from an
+        older process can no longer advance the cursor.  To re-attach without
+        a takeover of an in-flight consumer, use `subscribe_status`."""
+        if not isinstance(name, str) or not name:
+            raise StoreError("BAD_REQUEST", "subscription name must be non-empty")
+        if not isinstance(after_seq, int) or isinstance(after_seq, bool):
+            raise StoreError("BAD_REQUEST", "after_seq must be an integer")
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._subscription_row(c, name)
+                if row is not None:
+                    if after_seq != row[0]:
+                        raise StoreError(
+                            "SUBSCRIPTION_EXISTS",
+                            f"subscription {name!r} already exists with"
+                            f" origin_seq {row[0]}; refusing to reset it")
+                    generation = row[3] + 1
+                    c.execute("UPDATE subscriptions SET generation=? WHERE name=?",
+                              (generation, name))
+                    c.commit()
+                    st = self._sub_state(c, name)
+                    st.update({"created": False, "claimed": True,
+                               "generation": generation})
+                    return st
+                lo, hi = self._stream_bounds(c)
+                if after_seq < lo or after_seq > hi:
+                    raise StoreError(
+                        "OUT_OF_RANGE",
+                        f"after_seq {after_seq} outside the retained log"
+                        f" [{lo}, {hi}]",
+                        {"min_after": lo, "max_after": hi,
+                         "log_low": self._log_floor(c), "log_high": hi})
+                c.execute(
+                    "INSERT INTO subscriptions(name,origin_seq,acked_seq,"
+                    "delivered_seq,generation,paused) VALUES (?,?,?,?,1,0)",
+                    (name, after_seq, after_seq, after_seq))
+                c.commit()
+                st = self._sub_state(c, name)
+                st.update({"created": True, "claimed": False})
+                return st
+            finally:
+                c.close()
+
+    def handle_claim(self, name):
+        """Take over consumption of an existing subscription: bump the
+        generation, invalidating every older one.  Delayed pulls and acks
+        from an older generation are rejected; the cursor itself is kept."""
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._subscription_row(c, name)
+                if row is None:
+                    raise StoreError("NO_SUBSCRIPTION", f"unknown subscription {name!r}")
+                generation = row[3] + 1
+                c.execute("UPDATE subscriptions SET generation=? WHERE name=?",
+                          (generation, name))
+                c.commit()
+                st = self._sub_state(c, name)
+                st.update({"claimed": True, "generation": generation})
+                return st
+            finally:
+                c.close()
+
+    @staticmethod
+    def _require_generation(row, generation, name):
+        if generation is None or isinstance(generation, bool) \
+                or not isinstance(generation, int):
+            raise StoreError("BAD_REQUEST", "generation is required")
+        if generation != row[3]:
+            raise StoreError(
+                "STALE_GENERATION",
+                f"subscription {name!r} is at generation {row[3]},"
+                f" not {generation}")
+        return generation
+
+    def handle_pull(self, name, generation=None, max_commits=100,
+                    max_bytes=1024 * 1024):
+        if max_commits is None:
+            max_commits = 100
+        if max_bytes is None:
+            max_bytes = 1024 * 1024
+        if not isinstance(max_commits, int) or isinstance(max_commits, bool) \
+                or max_commits < 1:
+            raise StoreError("BAD_REQUEST", "max_commits must be >= 1")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
+                or max_bytes < 1:
+            raise StoreError("BAD_REQUEST", "max_bytes must be >= 1")
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._subscription_row(c, name)
+                if row is None:
+                    raise StoreError("NO_SUBSCRIPTION", f"unknown subscription {name!r}")
+                self._require_generation(row, generation, name)
+                origin, acked, delivered, gen, paused = row
+                visible = self._meta_int(c, "visible_seq")
+                if paused:
+                    st = self._sub_state(c, name, row)
+                    st.update({"items": [], "next_after": acked,
+                               "has_more": False, "over_budget": False,
+                               "oversize_seq": None, "bytes": 0,
+                               "delivered_seq": delivered})
+                    return st
+                # delivery always resumes from the confirmed prefix, so a
+                # repeated pull (same acked_seq) yields exactly the same
+                # commits and bytes
+                items, used, over_budget, oversize_seq, last = self._collect_changes(
+                    c, acked, visible, max_commits, max_bytes)
+                has_more = last < visible
+                if items and last > delivered:
+                    c.execute("UPDATE subscriptions SET delivered_seq=? WHERE name=?",
+                              (last, name))
+                    c.commit()
+                self._checkpoint("during_pull")
+                st = self._sub_state(c, name)
+                st.update({
+                    "items": items, "next_after": last, "has_more": has_more,
+                    "over_budget": over_budget, "oversize_seq": oversize_seq,
+                    "bytes": used,
+                })
+                return st
+            finally:
+                c.close()
+
+    def handle_ack(self, name, through_seq, generation):
+        """Confirm the contiguous, fully processed prefix ending at
+        through_seq.  Retries are idempotent; moving backwards, skipping past
+        what was delivered, or using a stale generation is refused without
+        changing the cursor."""
+        if not isinstance(through_seq, int) or isinstance(through_seq, bool):
+            raise StoreError("BAD_REQUEST", "through_seq must be an integer")
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._subscription_row(c, name)
+                if row is None:
+                    raise StoreError("NO_SUBSCRIPTION", f"unknown subscription {name!r}")
+                self._require_generation(row, generation, name)
+                origin, acked, delivered, gen, paused = row
+                if through_seq > delivered:
+                    raise StoreError(
+                        "BAD_ACK",
+                        f"cannot confirm {through_seq}: only the contiguous"
+                        f" delivered prefix through {delivered} exists")
+                if through_seq < acked:
+                    raise StoreError(
+                        "BAD_ACK",
+                        f"cannot move the confirmed prefix backwards from"
+                        f" {acked} to {through_seq}")
+                if through_seq > acked:
+                    c.execute("UPDATE subscriptions SET acked_seq=? WHERE name=?",
+                              (through_seq, name))
+                    c.commit()
+                self._checkpoint("during_ack")
+                st = self._sub_state(c, name)
+                st.update({"acked": through_seq, "advanced": through_seq > acked})
+                return st
+            finally:
+                c.close()
+
+    def handle_set_paused(self, name, paused, generation=None):
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._subscription_row(c, name)
+                if row is None:
+                    raise StoreError("NO_SUBSCRIPTION", f"unknown subscription {name!r}")
+                self._require_generation(row, generation, name)
+                c.execute("UPDATE subscriptions SET paused=? WHERE name=?",
+                          (1 if paused else 0, name))
+                c.commit()
+                st = self._sub_state(c, name)
+                st.update({"paused": bool(paused)})
+                return st
+            finally:
+                c.close()
+
+    def handle_replay(self, name, after_seq, generation=None,
+                      max_commits=100, max_bytes=1024 * 1024):
+        """Re-deliver already delivered commits from a retained position.
+        Never moves any cursor.  Positions before the retained range or
+        beyond the delivered range are refused with the usable range."""
+        if not isinstance(after_seq, int) or isinstance(after_seq, bool):
+            raise StoreError("BAD_REQUEST", "after_seq must be an integer")
+        if max_commits is None:
+            max_commits = 100
+        if max_bytes is None:
+            max_bytes = 1024 * 1024
+        if not isinstance(max_commits, int) or isinstance(max_commits, bool) \
+                or max_commits < 1:
+            raise StoreError("BAD_REQUEST", "max_commits must be >= 1")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
+                or max_bytes < 1:
+            raise StoreError("BAD_REQUEST", "max_bytes must be >= 1")
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._subscription_row(c, name)
+                if row is None:
+                    raise StoreError("NO_SUBSCRIPTION", f"unknown subscription {name!r}")
+                self._require_generation(row, generation, name)
+                origin, acked, delivered, gen, paused = row
+                log_low = self._log_floor(c)
+                low = max(origin, log_low - 1)
+                high = delivered
+                if after_seq < low or after_seq > high:
+                    raise StoreError(
+                        "OUT_OF_RANGE",
+                        f"replay position {after_seq} outside the retained"
+                        f" delivered range [{low}, {high}] (origin {origin},"
+                        f" log_low {log_low}, delivered {delivered})",
+                        {"min_after": low, "max_after": high,
+                         "log_low": log_low, "log_high": self._meta_int(
+                             c, "visible_seq"),
+                         "origin_seq": origin, "delivered_seq": delivered})
+                items, used, over_budget, oversize_seq, last = self._collect_changes(
+                    c, after_seq, high, max_commits, max_bytes)
+                st = self._sub_state(c, name)
+                st.update({"items": items, "next_after": last,
+                           "has_more": last < high, "over_budget": over_budget,
+                           "oversize_seq": oversize_seq, "bytes": used,
+                           "replay": True, "after_seq": after_seq,
+                           "range": {"low": low, "high": high}})
+                return st
+            finally:
+                c.close()
+
+    def handle_cleanup(self, up_to):
+        """Release change payloads through up_to, but never past what an
+        unconfirmed subscriber or crash recovery still needs.  The retained
+        range moves in a single control transaction."""
+        if not isinstance(up_to, int) or isinstance(up_to, bool):
+            raise StoreError("BAD_REQUEST", "up_to must be an integer")
+        with self.commit_lock:
+            c = self._control()
+            try:
+                visible = self._meta_int(c, "visible_seq")
+                floor = self._log_floor(c)
+                if up_to > visible:
+                    raise StoreError(
+                        "OUT_OF_RANGE",
+                        f"cleanup upper bound {up_to} is beyond the committed"
+                        f" log end {visible}")
+                if up_to < floor - 1:
+                    # already cleaned past this point: a stable no-op
+                    st = self._cleanup_report(c, floor - 1, 0, [])
+                    st["requested_up_to"] = up_to
+                    st["noop"] = True
+                    return st
+                blockers = []
+                safe = visible
+                for (sub_name, sub_acked) in c.execute(
+                        "SELECT name, acked_seq FROM subscriptions"
+                        " ORDER BY name").fetchall():
+                    if sub_acked < up_to:
+                        safe = min(safe, sub_acked)
+                        blockers.append(sub_name)
+                unapplied = c.execute(
+                    "SELECT MIN(seq) FROM commits WHERE applied=0").fetchone()[0]
+                if unapplied is not None and unapplied <= up_to:
+                    safe = min(safe, unapplied - 1)
+                    blockers.append("recovery")
+                safe = max(safe, floor - 1)
+                if up_to > safe:
+                    raise StoreError(
+                        "CLEANUP_BLOCKED",
+                        f"cannot clean through {up_to}: unconfirmed subscribers"
+                        f" or recovery still need commits (safe upper bound"
+                        f" {safe}, blockers {blockers})",
+                        {"safe_up_to": safe, "blocked_by": blockers,
+                         "log_low": floor})
+                released = c.execute(
+                    "SELECT COUNT(*) FROM commits WHERE seq<=? AND payload_live=1",
+                    (up_to,)).fetchone()[0]
+                # payload release and the retained-range change are one
+                # transaction: a crash leaves either the whole old range or
+                # the whole new range, never a partly visible boundary
+                c.execute(
+                    "UPDATE commits SET payload_live=0, deliver_json=NULL,"
+                    " apply_json='{}', bump_json='[]'"
+                    " WHERE seq<=? AND applied=1", (up_to,))
+                c.commit()
+                self._checkpoint("during_cleanup")
+                return self._cleanup_report(c, up_to, released, [])
+            finally:
+                c.close()
+
+    def _cleanup_report(self, c, cleaned_to, released, blockers):
+        low = self._log_floor(c)
+        return {
+            "cleaned_to": cleaned_to,
+            "released_commits": released,
+            "log_low": low,
+            "log_high": self._meta_int(c, "visible_seq"),
+            "min_after": low - 1,
+            "blocked_by": blockers,
+        }
+
+    def handle_subscriptions(self):
+        with self.commit_lock:
+            c = self._control()
+            try:
+                names = [r[0] for r in c.execute(
+                    "SELECT name FROM subscriptions ORDER BY name").fetchall()]
+                return {"subscriptions": [self._sub_state(c, n) for n in names],
+                        "log_low": self._log_floor(c),
+                        "log_high": self._meta_int(c, "visible_seq"),
+                        "min_after": self._log_floor(c) - 1}
+            finally:
+                c.close()
+
+    def handle_subscription_status(self, name):
+        with self.commit_lock:
+            c = self._control()
+            try:
+                return self._sub_state(c, name)
+            finally:
+                c.close()
 
     # ------------------------------------------------------------ recovery
     def _recover(self):
@@ -377,14 +851,23 @@ class Server:
                     bump = [source, left_id, right_id]
                 wire_apply = {sid: [common.op_to_wire(op) for op in sos]
                               for sid, sos in apply_map.items()}
+                wire_ops = [common.op_to_wire(op) for op in ops]
                 receipt = {"commit_seq": seq, "epoch": epoch,
                            "request_id": request_id, "ops_applied": len(ops)}
+                # the change payload: the caller's ops in caller order, with
+                # the original wire forms (so retransmitted request ids stay
+                # byte-identical); deletes of missing keys are included too
+                deliver = {"request_id": request_id, "epoch": epoch,
+                           "watermark": self._write_watermark(request_id),
+                           "ops": wire_ops}
                 # the durable commit decision
                 c.execute(
                     "INSERT INTO commits(seq,request_id,request_hash,receipt_json,"
-                    "apply_json,bump_json,applied) VALUES (?,?,?,?,?,?,0)",
+                    "apply_json,bump_json,applied,deliver_json,payload_live)"
+                    " VALUES (?,?,?,?,?,?,0,?,1)",
                     (seq, request_id, req_hash, json.dumps(receipt),
-                     json.dumps(wire_apply), json.dumps(bump)))
+                     json.dumps(wire_apply), json.dumps(bump),
+                     json.dumps(deliver)))
                 c.commit()
                 self._checkpoint("after_decision")
                 try:
@@ -981,6 +1464,32 @@ class Server:
             return self.handle_test_arm_crash(args["point"])
         if op == "test_pause_copy":
             return self.handle_test_pause_copy(bool(args["on"]))
+        # ---------------------------------------------------- subscriptions
+        if op == "subscribe":
+            return self.handle_subscribe(args["name"], int(args["after_seq"]))
+        if op == "claim":
+            return self.handle_claim(args["name"])
+        if op == "pull":
+            return self.handle_pull(args["name"], args.get("generation"),
+                                    args.get("max_commits"),
+                                    args.get("max_bytes"))
+        if op == "ack":
+            return self.handle_ack(args["name"], int(args["through_seq"]),
+                                   args.get("generation"))
+        if op == "set_paused":
+            return self.handle_set_paused(args["name"], bool(args["paused"]),
+                                          args.get("generation"))
+        if op == "replay":
+            return self.handle_replay(args["name"], int(args["after_seq"]),
+                                      args.get("generation"),
+                                      args.get("max_commits"),
+                                      args.get("max_bytes"))
+        if op == "cleanup":
+            return self.handle_cleanup(int(args["up_to"]))
+        if op == "subscriptions":
+            return self.handle_subscriptions()
+        if op == "subscription_status":
+            return self.handle_subscription_status(args["name"])
         raise StoreError("BAD_REQUEST", f"unknown op {op!r}")
 
     def _handle_conn(self, conn):
@@ -991,8 +1500,10 @@ class Server:
                     result = self._dispatch(req)
                     common.send_msg(conn, {"ok": True, "result": result})
                 except StoreError as e:
-                    common.send_msg(conn, {"ok": False, "error": {
-                        "code": e.code, "message": e.message}})
+                    err = {"code": e.code, "message": e.message}
+                    if e.detail:
+                        err["detail"] = e.detail
+                    common.send_msg(conn, {"ok": False, "error": err})
                 except (ProtoError, KeyError, TypeError, ValueError) as e:
                     common.send_msg(conn, {"ok": False, "error": {
                         "code": "BAD_REQUEST", "message": str(e)}})
