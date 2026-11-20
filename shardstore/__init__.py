@@ -5,4 +5,4 @@ length-prefixed JSON protocol over a unix socket so multiple processes can
 share one store.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

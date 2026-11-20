@@ -151,6 +151,86 @@ s.ack(name, gen, page.next_after)
 游标、双写状态都在控制库）；发布事务是原子的，不会出现两套同时生效的
 路由；回收中断则重做（删文件幂等）。
 
+## 一致性快照导出与空目录恢复
+
+在线把某个**已提交水位**导出成一份与源目录、分片文件名、绝对路径无关的
+便携备份，再在另一个空目录恢复成一个可读写的新实例。导出全程源服务继续
+接受写入与 split，无需停服，也不要求永久保留历史变更载荷。
+
+### 一致性点（读令牌 + MVCC + 路由纪元）
+
+`export` 先 `open_read()` 取得一个普通读令牌，钉住
+`(read_seq=watermark, epoch)`。行版本只按该点从对应纪元的分片流式读取；
+令牌未释放前，MVCC GC 与 split 回收都不能删除它依赖的行版本或分片文件，
+因此导出期间并发的提交、split、清理都不可能让不同分片来自不同提交点、
+漏行、重复行或混用路由。水位之后才提交的写不会进入备份。
+
+### 备份格式（自描述、可离线校验）
+
+```
+<backup>/
+  MANIFEST.json   信任根：format / format_version / 水位 commit_seq /
+                  导出时纪元 / 行与回执记录数 / 与分片无关的全局键范围 /
+                  完整路由视图（仅标签 + 半开键界）/ 每段 length + SHA-256
+  seg-000001.dat  长度前缀 JSON 帧流（uint32 大端长度 + JSON；int64 走
+  seg-000002.dat  十进制字符串、BLOB 走 base64）。先若干 rows 段，再若干
+  ...             receipts 段；段按 64MiB 目标大小滚动，单条超大值整条落盘
+```
+
+- `row` 帧按 `(tenant UTF-8 字节序, 有符号 key)` 全局严格排序、主键唯一；
+  NULL / int64 / BLOB 精确保留。
+- `receipt` 帧是每个已决定提交的幂等回执（seq、request_id、request_hash、
+  原始 receipt），按 seq 严格有序。**历史变更载荷不进备份**：清理后仍保留
+  的回执照样导出，恢复后相同 request_id 仍返回原回执、冲突仍 `CONFLICT`，
+  但不会把已清理的提交载荷伪装成可重放的变更流。
+- 清单与每段的长度、SHA-256 都可直接对备份字节重新计算验证；备份里没有
+  源数据目录、源分片文件名或绝对路径。
+
+### 发布原子性
+
+写入全部进入独立临时目录（`.snapshot-<随机>` / `.restore-<随机>`）：
+
+- 导出：数据段与 `MANIFEST.json` 全部落盘并**自校验通过**后，一次
+  `os.replace` 原子发布；中断只留下无法被识别为备份的匿名临时数据
+  （没有 manifest 的目录 `inspect` 报 `BACKUP_INCOMPLETE`）。
+- 恢复：只允许写入**不存在或为空**的目标目录。先做完整离线校验（清单、
+  格式版本、每段长度/摘要、帧格式、全局排序与主键唯一、路由覆盖），再在
+  暂存目录构建数据目录并回读交叉核对，最后一次原子 rename 发布。任何阶段
+  失败或进程退出，目标都不会呈现为可用半成品，也绝不覆盖已有数据
+  （非空目标报 `TARGET_NOT_EMPTY`）。
+
+### 恢复后的语义
+
+- 当前行值、复合键排序、NULL/int64/BLOB 与水位的逻辑状态逐字节一致；
+  恢复实例的 `visible_seq = watermark`，下一次写入取 `watermark+1`，序号
+  连续不复用。
+- 备份内 request_id 的原始回执仍用于去重，恢复不会重做这些请求。
+- 订阅**从水位重新建立**：源订阅者、未确认游标、读令牌、split 状态都不
+  迁移；新订阅的最早位置是 `watermark`（报告中的
+  `subscription_resume_after_seq`，保留日志下界为 `watermark+1`）。
+- 全程流式、内存有界：导出按分页游标读行、按批读回执；恢复按批写分片、
+  逐帧校验，不把整库或全部回执装入内存。
+
+### 入口
+
+```python
+rep = s.snapshot_export("/backups/b1")     # 在线导出（服务端绝对路径）
+s.snapshot_inspect("/backups/b1")          # 仅校验并回报水位/摘要/边界
+s.snapshot_restore("/backups/b1", "/data/newstore")  # 仅空目录可恢复
+```
+
+离线（不经过服务）也可检查与恢复：
+
+```bash
+python3 -m shardstore.snapshot inspect /backups/b1
+python3 -m shardstore.snapshot restore /backups/b1 /data/newstore
+```
+
+错误以稳定码返回：`CORRUPT_BACKUP`、`UNSUPPORTED_FORMAT`、
+`BACKUP_INCOMPLETE`、`BACKUP_NOT_FOUND`、`BACKUP_EXISTS`、
+`TARGET_NOT_EMPTY`。崩溃测试钩子见下文（`*_snapshot_*` /
+`*_restore_*` 点）。
+
 ## 运行
 
 ```bash
@@ -167,6 +247,11 @@ KEEP=1 python3 acceptance.py     # 保留工作目录便于检查
 python3 subscription_acceptance.py
 SUB_BACKLOG=2000 python3 subscription_acceptance.py
 ONLY="cleanup and receipts" python3 subscription_acceptance.py
+
+# 一致性快照验收（独立水位字典模型 + 直接对备份字节校验，多进程崩溃演练）
+python3 snapshot_acceptance.py
+SNAP_SCALE_ROWS=120000 python3 snapshot_acceptance.py
+ONLY="crash" python3 snapshot_acceptance.py
 ```
 
 ## 客户端 API 摘要
@@ -198,12 +283,22 @@ r = s.replay("etl-a", gen, after_seq=41)            # 保留范围内重放，�
 s.claim("etl-a")                                    # 新消费世代，旧世代作废
 s.subscribe_status("etl-a"); s.subscriptions()
 s.cleanup(100)                                      # 释放载荷，绝不越过未确认前缀
+
+# 一致性快照（路径为服务端绝对路径；恢复目标必须是空目录）
+rep = s.snapshot_export("/backups/b1")             # 水位/计数/键范围/段摘要
+s.snapshot_inspect("/backups/b1")                  # 离线校验 + 订阅恢复边界
+s.snapshot_restore("/backups/b1", "/data/new")     # 原子发布，绝不覆盖已有数据
 ```
 
 测试钩子（验收脚本使用）：`pause_copy(on)` 暂停/恢复拷贝线程（同步点），
 `arm_crash(point)` 在指定阶段点强制退出（`after_decision`、`during_copy`、
 `after_copy`、`after_catchup`、`before_publish`、`after_publish`、
-`during_reclaim`、`during_pull`、`during_ack`、`during_cleanup`）。
+`during_reclaim`、`during_pull`、`during_ack`、`during_cleanup`、
+`during_snapshot_segments`、`before_snapshot_manifest`、
+`after_snapshot_manifest`、`during_restore_verify`、
+`during_restore_build`、`before_restore_publish`、
+`after_restore_publish`）。段滚动阈值可用环境变量
+`SHARDSTORE_SEG_TARGET`（字节，>=1024）调小以演练多段备份。
 
 ## 验收覆盖
 
@@ -223,4 +318,16 @@ request_id、跨片事务、活跃旧令牌阻止回收、release 后可回收�
 阻、清理后 request_id 回执与冲突、过期重放明确失败、空流/有符号边界键/
 NULL/BLOB、拉取/确认/清理期间强制结束并重开、多进程争用同一订阅、
 迁移期间的新提交、大积压分页的有界内存。
+
+`snapshot_acceptance.py` 用**按水位保留全量逻辑行与请求回执的独立字典
+模型**，并**直接对备份字节**（独立实现的帧解析、长度与 SHA-256 重算，
+不调用导出/恢复实现）核对：跨多分片的 NULL/BLOB/有符号边界键事务、导出
+与并发写入及 split 同时进行时备份恰好等于清单水位而不含之后的写、恢复后
+行/排序/类型逐字节一致且序号从水位连续、旧 request_id 返回原回执而冲突
+被拒、订阅只能从水位重建；在导出段写入/清单发布、恢复校验/分片构建/最终
+发布各点强制退出并重开，确认只有完整备份可恢复、空目标不暴露半成品、
+已有目录不被覆盖；并覆盖损坏/截断/篡改段、伪造长度与摘要、未知格式版本、
+重复主键、乱序帧、缺失段与清单、空库、清理后仍保留的幂等回执、多个源
+分片映射到恢复布局、8MiB 超大单值，以及运行时生成大数据量的有界内存
+（RSS 采样）与多段滚动。
 

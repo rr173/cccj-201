@@ -34,6 +34,7 @@ resume or finish an interrupted split/reclaim from the persisted state.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import secrets
@@ -132,6 +133,14 @@ CRASH_POINTS = {
     "during_pull",      # subscription: after the delivery cursor advanced
     "during_ack",       # subscription: after writing the confirmed prefix
     "during_cleanup",   # subscription log: after the boundary check, before GC
+    # snapshot export / restore crash window points (test hooks)
+    "during_snapshot_segments",   # export: after a data segment batch/rotation
+    "before_snapshot_manifest",   # export: segments durable, before manifest
+    "after_snapshot_manifest",    # export: manifest durable, before publish
+    "during_restore_verify",      # restore: during full backup verification
+    "during_restore_build",       # restore: after a target shard build batch
+    "before_restore_publish",     # restore: build done, before atomic publish
+    "after_restore_publish",      # restore: just after the atomic publish
 }
 
 ACTIVE_SPLIT_PHASES = ("COPYING", "CATCHING_UP")
@@ -1412,6 +1421,276 @@ class Server:
                         "state": states.get(sid)} for sid, lo, hi in routes],
         }
 
+    # ------------------------------------------------------------ snapshots
+    # A snapshot pins one committed frontier together with the complete
+    # routing view at that frontier.  The pin is an ordinary read token, so
+    # concurrent commits and splits keep their existing contracts: the MVCC
+    # row versions and the shard files this snapshot reads stay reachable
+    # until the token is released, and GC/reclaim can never remove them.
+    def _snapshot_check_absolute(self, path, what):
+        from shardstore.snapshot import SnapshotError
+        if not isinstance(path, str) or not path:
+            raise StoreError("BAD_REQUEST", f"{what} must be a non-empty path")
+        if not os.path.isabs(path):
+            raise StoreError("BAD_REQUEST",
+                             f"{what} must be an absolute path, got {path!r}")
+        return path
+
+    def _snapshot_routing_view(self, c, epoch):
+        """The shard-independent routing view stored in the backup."""
+        from shardstore import snapshot
+        routes = self._routes(c, epoch)
+        view = []
+        for sid, lo, hi in routes:
+            view.append({"shard": sid,
+                         "lo": snapshot.enc_bound(lo),
+                         "hi": snapshot.enc_bound(hi)})
+        return view
+
+    def handle_snapshot_export(self, backup_path):
+        """Stream a portable, consistent backup of one committed frontier.
+
+        The source service keeps accepting writes and splits for the whole
+        export: rows are read through a pinned read token (read_seq + epoch),
+        receipts come from the durable commit table, and the backup only
+        becomes visible once every segment and the manifest are complete and
+        re-verified.  Nothing is buffered wholesale in memory.
+        """
+        from shardstore import snapshot
+        self._snapshot_check_absolute(backup_path, "backup path")
+        if os.path.lexists(backup_path):
+            raise StoreError(
+                "BACKUP_EXISTS",
+                f"backup destination {backup_path!r} already exists; choose a"
+                f" new path, backups are never overwritten")
+        parent = os.path.dirname(os.path.abspath(backup_path))
+        if not os.path.isdir(parent):
+            raise StoreError(
+                "BAD_REQUEST",
+                f"parent directory of the backup does not exist: {parent!r}")
+
+        # pin the consistency point: one committed seq + one complete routing
+        # epoch.  The token keeps every row version and shard file this
+        # snapshot needs alive despite concurrent GC, split and reclaim.
+        token = self.handle_open_read()
+        token_id = token["token"]
+        watermark = token["read_seq"]
+        epoch = token["epoch"]
+        staging = os.path.join(parent, ".snapshot-" + secrets.token_hex(12))
+        try:
+            try:
+                return self._snapshot_export_locked(
+                    snapshot, staging, backup_path, parent, token_id,
+                    watermark, epoch)
+            except snapshot.SnapshotError as e:
+                raise StoreError(e.code, e.message, e.detail) from e
+        except BaseException:
+            import shutil
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        finally:
+            # the pin is released exactly once, whatever happened above
+            try:
+                self.handle_release(token_id)
+            except Exception:
+                traceback.print_exc()
+
+    def _snapshot_export_locked(self, snapshot, staging, backup_path, parent,
+                                token_id, watermark, epoch):
+        """Body of the export; the caller owns staging cleanup and the pin."""
+        os.mkdir(staging)
+        c = self._control()
+        try:
+            routes = self._routes(c, epoch)
+            routing_view = self._snapshot_routing_view(c, epoch)
+            # sanity: the epoch must partition the whole key domain
+            if not routes or routes[0][1] is not None \
+                    or routes[-1][2] is not None:
+                raise StoreError("INTERNAL",
+                                 f"epoch {epoch} routing is incomplete")
+        finally:
+            c.close()
+
+        segment_no = 0
+
+        def open_segment(role):
+            nonlocal segment_no
+            segment_no += 1
+            name = f"seg-{segment_no:06d}.dat"
+            return snapshot.SegmentWriter(
+                os.path.join(staging, name), name)
+
+        segments = []
+        row_count = 0
+        key_first = None
+        key_last = None
+
+        # ---- rows: route by route, in the global composite order, each
+        # page small enough to bound memory regardless of database size
+        writer = open_segment("rows")
+        try:
+            for sid, rlo, rhi in routes:
+                cursor = None
+                while True:
+                    batch = self._snapshot_scan_batch(
+                        sid, watermark, rlo, rhi, cursor, self.batch_size)
+                    if not batch:
+                        break
+                    for (tenant, key, value) in batch:
+                        writer.write_row(tenant, key, value)
+                        if key_first is None:
+                            key_first = snapshot.enc_key(tenant, key)
+                        key_last = snapshot.enc_key(tenant, key)
+                        row_count += 1
+                    cursor = (batch[-1][0], batch[-1][1])
+                    if writer.length >= snapshot.segment_target_bytes():
+                        segments.append(self._close_segment(writer, "rows"))
+                        writer = open_segment("rows")
+                    if row_count % (self.batch_size * 4) == 0:
+                        self._checkpoint("during_snapshot_segments")
+        finally:
+            if writer.record_count or not segments:
+                segments.append(self._close_segment(writer, "rows"))
+            else:
+                writer.close()
+                os.unlink(writer.path)
+
+        # ---- idempotency receipts: every decided commit through the
+        # watermark, including ones whose change payload was cleaned up.
+        # Streamed straight from SQLite; historical payloads are not
+        # exported at all.
+        writer = open_segment("receipts")
+        receipt_count = 0
+        try:
+            c = self._control()
+            try:
+                cursor_seq = 0
+                while True:
+                    rows = c.execute(
+                        "SELECT seq, request_id, request_hash, receipt_json"
+                        " FROM commits WHERE seq>? AND seq<=?"
+                        " ORDER BY seq LIMIT ?",
+                        (cursor_seq, watermark, self.batch_size)).fetchall()
+                    if not rows:
+                        break
+                    for seq, rid, rh, rj in rows:
+                        writer.write_receipt(seq, rid, rh, rj)
+                        receipt_count += 1
+                        cursor_seq = seq
+                    if writer.length >= snapshot.segment_target_bytes():
+                        segments.append(
+                            self._close_segment(writer, "receipts"))
+                        writer = open_segment("receipts")
+                    self._checkpoint("during_snapshot_segments")
+            finally:
+                c.close()
+        finally:
+            if writer.record_count or not any(
+                    s["role"] == "receipts" for s in segments):
+                segments.append(self._close_segment(writer, "receipts"))
+            else:
+                writer.close()
+                os.unlink(writer.path)
+
+        manifest = {
+            "format": snapshot.SNAPSHOT_FORMAT,
+            "format_version": snapshot.SNAPSHOT_VERSION,
+            "created_at": datetime.datetime.now(datetime.timezone.utc)
+            .isoformat(timespec="seconds"),
+            "watermark": watermark,
+            "epoch_at_export": epoch,
+            "row_count": row_count,
+            "receipt_count": receipt_count,
+            "key_range": {"first": key_first, "last": key_last},
+            "routing": routing_view,
+            "segments": segments,
+        }
+        self._checkpoint("before_snapshot_manifest")
+        snapshot.write_manifest_atomic(staging, manifest)
+        self._checkpoint("after_snapshot_manifest")
+
+        # re-verify the whole staging backup from its bytes before it may
+        # become visible; a crash here leaves only anonymous temp data
+        try:
+            _m, report = snapshot.verify_backup(staging)
+        except snapshot.SnapshotError as e:
+            raise StoreError(e.code, e.message, e.detail) from e
+        if report["row_count"] != row_count \
+                or report["receipt_count"] != receipt_count \
+                or report["watermark"] != watermark:
+            raise StoreError("INTERNAL",
+                             "snapshot self-verification disagreed with"
+                             " the export counters")
+        # the destination was empty at entry; never overwrite a path that
+        # appeared while the (potentially long) export was running
+        if os.path.lexists(backup_path):
+            raise StoreError(
+                "BACKUP_EXISTS",
+                f"backup destination {backup_path!r} appeared during the"
+                f" export; the completed backup is kept in staging and is"
+                f" not published over it")
+        # single atomic publication; an interrupted rename leaves either
+        # the staging temp data or the finished backup, never a mix
+        os.replace(staging, backup_path)
+        snapshot._fsync_dir(parent)
+        report.update({
+            "backup_path": os.path.abspath(backup_path),
+            "published": True,
+            "subscription_resume_after_seq": watermark,
+            "retained_log_low": watermark + 1,
+        })
+        return report
+
+    def _close_segment(self, writer, role):
+        writer.close()
+        return writer.descriptor(role)
+
+    def _snapshot_scan_batch(self, shard_id, read_seq, rlo, rhi, cursor, limit):
+        """One bounded, MVCC-pinned page of live rows from one shard."""
+        conn = self._shard_conn(shard_id)
+        try:
+            sql = ("SELECT tenant, k, vt, vi, vb FROM ("
+                   "SELECT tenant, k, MAX(seq) AS mseq, op, vt, vi, vb FROM kv"
+                   " WHERE seq <= ?")
+            params = [read_seq]
+            if rlo is not None:
+                sql += " AND (tenant, k) >= (?, ?)"
+                params.extend([rlo[0], rlo[1]])
+            if rhi is not None:
+                sql += " AND (tenant, k) < (?, ?)"
+                params.extend([rhi[0], rhi[1]])
+            if cursor is not None:
+                sql += " AND (tenant, k) > (?, ?)"
+                params.extend([cursor[0], cursor[1]])
+            sql += (" GROUP BY tenant, k) WHERE op = 'put'"
+                    " ORDER BY tenant, k LIMIT ?")
+            params.append(limit)
+            return [(t, k, (vt, vi, vb))
+                    for (t, k, vt, vi, vb)
+                    in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def handle_snapshot_inspect(self, backup_path):
+        from shardstore import snapshot
+        self._snapshot_check_absolute(backup_path, "backup path")
+        try:
+            _manifest, report = snapshot.verify_backup(backup_path)
+        except snapshot.SnapshotError as e:
+            raise StoreError(e.code, e.message, e.detail)
+        return report
+
+    def handle_snapshot_restore(self, backup_path, target_dir):
+        from shardstore import snapshot
+        self._snapshot_check_absolute(backup_path, "backup path")
+        self._snapshot_check_absolute(target_dir, "target directory")
+        try:
+            return snapshot.restore_backup(
+                backup_path, target_dir,
+                crash_cb=lambda point: self._checkpoint(point))
+        except snapshot.SnapshotError as e:
+            raise StoreError(e.code, e.message, e.detail)
+
     # ------------------------------------------------------------ test hooks
     def handle_test_arm_crash(self, point):
         if point not in CRASH_POINTS:
@@ -1490,6 +1769,14 @@ class Server:
             return self.handle_subscriptions()
         if op == "subscription_status":
             return self.handle_subscription_status(args["name"])
+        # -------------------------------------------------------- snapshots
+        if op == "snapshot_export":
+            return self.handle_snapshot_export(args["backup_path"])
+        if op == "snapshot_inspect":
+            return self.handle_snapshot_inspect(args["backup_path"])
+        if op == "snapshot_restore":
+            return self.handle_snapshot_restore(args["backup_path"],
+                                                args["target_dir"])
         raise StoreError("BAD_REQUEST", f"unknown op {op!r}")
 
     def _handle_conn(self, conn):

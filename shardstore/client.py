@@ -154,9 +154,9 @@ class Store:
         self.sock_path = sock_path
         self.timeout = timeout
 
-    def _rpc(self, op, **args):
+    def _rpc(self, op, timeout=None, **args):
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(self.timeout)
+        s.settimeout(timeout or self.timeout)
         try:
             s.connect(self.sock_path)
             common.send_msg(s, {"op": op, "args": args})
@@ -297,6 +297,36 @@ class Store:
 
     def reclaim(self):
         return self._rpc("reclaim")
+
+    # ---------------------------------------------------------- snapshots
+    def snapshot_export(self, backup_path, timeout=3600.0):
+        """Stream a consistent, portable backup of one committed frontier
+        while the service keeps accepting writes and splits.  The backup at
+        `backup_path` (an absolute path on the server's filesystem) appears
+        atomically; interrupted temporary data is never recognized as a
+        backup.  The report carries the watermark (commit_seq), format
+        version, row/receipt counts, shard-independent key ranges and every
+        segment's length and SHA-256."""
+        return self._rpc("snapshot_export", timeout=timeout,
+                         backup_path=backup_path)
+
+    def snapshot_inspect(self, backup_path, timeout=600.0):
+        """Verify a backup offline (manifest, format, lengths, hashes,
+        ordering, primary-key uniqueness, routing coverage) and return its
+        status report, including the watermark and the subscription resume
+        boundary.  Raises StoreError with code CORRUPT_BACKUP /
+        UNSUPPORTED_FORMAT / BACKUP_INCOMPLETE on any defect."""
+        return self._rpc("snapshot_inspect", timeout=timeout,
+                         backup_path=backup_path)
+
+    def snapshot_restore(self, backup_path, target_dir, timeout=3600.0):
+        """Verify the backup and build a fresh read-write instance in the
+        empty absolute directory `target_dir`.  Existing data is never
+        overwritten; a failure or a killed process never leaves a usable
+        half-store.  The report states the watermark at which the change
+        stream resumes (subscriptions must re-register after that seq)."""
+        return self._rpc("snapshot_restore", timeout=timeout,
+                         backup_path=backup_path, target_dir=target_dir)
 
     def shutdown(self):
         return self._rpc("shutdown")
