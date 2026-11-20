@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS commits (
   bump_json TEXT NOT NULL,
   applied INTEGER NOT NULL DEFAULT 0,
   deliver_json TEXT,
-  payload_live INTEGER NOT NULL DEFAULT 1
+  payload_live INTEGER NOT NULL DEFAULT 1,
+  prior_json TEXT
 );
 CREATE TABLE IF NOT EXISTS subscriptions (
   name TEXT PRIMARY KEY,
@@ -102,6 +103,51 @@ CREATE TABLE IF NOT EXISTS splits (
   copy_done INTEGER NOT NULL DEFAULT 0,
   phase TEXT NOT NULL,
   new_epoch INTEGER
+);
+-- when an epoch became the live routing epoch (used to pick the epoch that
+-- was active at a historical commit seq for view snapshots)
+CREATE TABLE IF NOT EXISTS epoch_meta (
+  epoch INTEGER PRIMARY KEY,
+  active_from_seq INTEGER NOT NULL
+);
+-- persistent grouped aggregate views: a definition + one row per build
+-- generation.  The active generation pointer only ever moves to a fully
+-- built generation, so a query never sees a half-built view.
+CREATE TABLE IF NOT EXISTS views (
+  name TEXT PRIMARY KEY,
+  active_gen INTEGER NOT NULL,
+  start_seq INTEGER NOT NULL,
+  created_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS view_generations (
+  view TEXT NOT NULL,
+  gen INTEGER NOT NULL,
+  start_seq INTEGER NOT NULL,
+  epoch INTEGER NOT NULL,
+  pin_token TEXT,
+  scan_done INTEGER NOT NULL DEFAULT 0,
+  scan_t TEXT, scan_k INTEGER,
+  agg_seq INTEGER NOT NULL,
+  phase TEXT NOT NULL,
+  error TEXT,
+  created_seq INTEGER NOT NULL,
+  PRIMARY KEY (view, gen)
+);
+-- append-only cumulative aggregate versions.  A group's value "as of seq W"
+-- is its row with the greatest seq <= W; cnt=0 means the group is empty and
+-- queries hide it.  The sum is an arbitrary-precision decimal string, never a
+-- SQLite integer, so totals beyond signed 64 bits stay exact.
+CREATE TABLE IF NOT EXISTS view_groups (
+  view TEXT NOT NULL,
+  gen INTEGER NOT NULL,
+  tenant TEXT NOT NULL COLLATE BINARY,
+  txt_null INTEGER NOT NULL,
+  txt TEXT NOT NULL COLLATE BINARY,
+  seq INTEGER NOT NULL,
+  cnt INTEGER NOT NULL,
+  ncnt INTEGER NOT NULL,
+  total TEXT NOT NULL,
+  PRIMARY KEY (view, gen, tenant, txt_null, txt, seq)
 );
 """
 
@@ -141,6 +187,13 @@ CRASH_POINTS = {
     "during_restore_build",       # restore: after a target shard build batch
     "before_restore_publish",     # restore: build done, before atomic publish
     "after_restore_publish",      # restore: just after the atomic publish
+    # grouped view crash window points (test hooks)
+    "during_view_build",          # view: after a source scan/undo batch
+    "during_view_fold",           # view: after a fold batch into the aggregate
+    "after_view_scan",            # view: scan done, before catch-up publish
+    "during_view_catchup",        # view: after a catch-up aggregate batch
+    "before_view_publish",        # view: aggregate complete, before the swap
+    "after_view_publish",         # view: just after the atomic generation swap
 }
 
 ACTIVE_SPLIT_PHASES = ("COPYING", "CATCHING_UP")
@@ -185,6 +238,8 @@ class Server:
         self.crash_points = set()                  # test hook (in-memory only)
         self.inflight_lock = threading.Lock()
         self.inflight = {}                         # token -> [epoch, read_seq, refs]
+        self._view_workers = set()                 # (view, gen) with a thread
+        self.view_fail_armed = False               # test hook (in-memory)
         self._init_control()
         self._recover()
 
@@ -250,10 +305,22 @@ class Server:
                 # they are outside the deliverable range, not a hole in it
                 c.execute("UPDATE commits SET payload_live=0"
                           " WHERE deliver_json IS NULL")
+            if "prior_json" not in cols:
+                # per-key before-values captured at commit time, used to seed
+                # a grouped view from a historical commit seq without relying
+                # on MVCC retention.  Default NULL = unknown for old rows.
+                c.execute("ALTER TABLE commits ADD COLUMN prior_json TEXT")
             c.execute("CREATE INDEX IF NOT EXISTS ix_commits_live"
                       " ON commits(payload_live, seq)")
             c.execute("CREATE INDEX IF NOT EXISTS ix_commits_applied"
                       " ON commits(applied)")
+            # epoch activation history: the initial (or restored) epoch has
+            # been live since sequence 0
+            if c.execute("SELECT COUNT(*) FROM epoch_meta").fetchone()[0] == 0:
+                epoch = int(c.execute(
+                    "SELECT v FROM meta WHERE k='epoch'").fetchone()[0])
+                c.execute("INSERT OR IGNORE INTO epoch_meta(epoch,active_from_seq)"
+                          " VALUES (?,0)", (epoch,))
             c.commit()
         finally:
             c.close()
@@ -736,6 +803,43 @@ class Server:
                 c.close()
             if row is not None:
                 self._start_copy_worker(split_id)
+            self._recover_views()
+
+    def _recover_views(self):
+        """Restart view builds/tailers that were interrupted.  A generation
+        either resumes from its persisted scan cursor / agg_seq or, if it
+        could not complete exactly, is marked FAILED; the active generation is
+        never disturbed."""
+        pending = []
+        with self.commit_lock:
+            c = self._control()
+            try:
+                for (view, gen, pin) in c.execute(
+                        "SELECT view, gen, pin_token FROM view_generations"
+                        " WHERE phase IN ('BUILDING','CATCHING_UP')"
+                        " ORDER BY view, gen").fetchall():
+                    # drop the pin a crashed build may have left behind; the
+                    # resumed build opens a fresh one
+                    if pin is not None:
+                        c.execute("UPDATE tokens SET released=1"
+                                  " WHERE token_id=?", (pin,))
+                    pending.append((view, gen))
+                # the active generation keeps tailing writes after a restart
+                for (view, gen) in c.execute(
+                        "SELECT v.name, v.active_gen FROM views v"
+                        " JOIN view_generations g ON g.view=v.name"
+                        "  AND g.gen=v.active_gen WHERE g.phase='READY'"
+                ).fetchall():
+                    pending.append((view, gen))
+                c.commit()
+            finally:
+                c.close()
+        seen = set()
+        for view, gen in pending:
+            if (view, gen) in seen:
+                continue
+            seen.add((view, gen))
+            self._start_view_worker(view, gen)
 
     def _recover_commits(self):
         """Replay commit decisions that did not finish applying (idempotent)."""
@@ -800,6 +904,14 @@ class Server:
             return sid
         raise StoreError("INTERNAL", "routing hole: no shard covers key")
 
+    def _check_view_fail(self):
+        """Test hook: raise once if a rebuild failure was injected, so the
+        acceptance drill can prove the previous generation stays intact."""
+        if self.view_fail_armed:
+            self.view_fail_armed = False
+            raise StoreError("VIEW_BUILD_FAILED",
+                             "injected view build failure (test hook)")
+
     def _checkpoint(self, point):
         if point in self.crash_points:
             sys.stderr.write(f"crash point reached: {point}\n")
@@ -858,6 +970,10 @@ class Server:
                             tgt = left_id if k < boundary else right_id
                             apply_map.setdefault(tgt, []).append(op)
                     bump = [source, left_id, right_id]
+                # capture the committed value of every distinct key just
+                # before this commit applies, in the same control transaction
+                # as the decision -> grouped views can seed from any seq
+                prior = self._capture_prior(c, routes, ops, seq)
                 wire_apply = {sid: [common.op_to_wire(op) for op in sos]
                               for sid, sos in apply_map.items()}
                 wire_ops = [common.op_to_wire(op) for op in ops]
@@ -872,11 +988,11 @@ class Server:
                 # the durable commit decision
                 c.execute(
                     "INSERT INTO commits(seq,request_id,request_hash,receipt_json,"
-                    "apply_json,bump_json,applied,deliver_json,payload_live)"
-                    " VALUES (?,?,?,?,?,?,0,?,1)",
+                    "apply_json,bump_json,applied,deliver_json,payload_live,"
+                    "prior_json) VALUES (?,?,?,?,?,?,0,?,1,?)",
                     (seq, request_id, req_hash, json.dumps(receipt),
                      json.dumps(wire_apply), json.dumps(bump),
-                     json.dumps(deliver)))
+                     json.dumps(deliver), json.dumps(prior)))
                 c.commit()
                 self._checkpoint("after_decision")
                 try:
@@ -1108,6 +1224,734 @@ class Server:
                 except Exception:
                     traceback.print_exc()
 
+    # ------------------------------------------------------ grouped views
+    # A view is a persistent, per-(tenant, nullable text) aggregate over the
+    # *logical* row state at a committed seq.  A build starts from a caller
+    # supplied committed start_seq, streams the MVCC state pinned by an
+    # ordinary read token in bounded pages, then folds every later commit in
+    # order.  The aggregate for one generation is append-only cumulative
+    # versions keyed by the commit seq they summarize: querying at watermark W
+    # reads, for each group, its greatest version <= W.  A generation becomes
+    # visible only in one control transaction after its aggregate has reached
+    # the live committed end, so a caller sees a complete old generation or a
+    # complete new one, never a partial build.
+    #
+    # Prior capture: the commit path stores, in the same control transaction as
+    # the durable decision, the committed value of every distinct key the
+    # commit touches.  Catch-up therefore folds a commit exactly from durable
+    # records without depending on MVCC retention, and never splits a
+    # cross-shard transaction: a commit becomes foldable only once applied.
+
+    def _capture_prior(self, c, routes, ops, seq):
+        """Committed value of each distinct op key just before `seq` applies.
+
+        Runs inside commit_lock against the same serial writer that is about
+        to install `seq`, read through the *current* routing, so it is correct
+        across shard boundaries and after a split.  Result:
+        {tenant: {decimal-key: wire value}}; missing = no live row."""
+        wanted = {}
+        for op in ops:
+            wanted.setdefault(op[1], set()).add(op[2])
+        prior = {}
+        for tenant, keys in wanted.items():
+            prior[tenant] = {}
+            by_shard = {}
+            for k in keys:
+                by_shard.setdefault(self._route_lookup(routes, tenant, k),
+                                    []).append(k)
+            for sid, ks in by_shard.items():
+                conn = self._shard_conn(sid)
+                try:
+                    qmarks = ",".join("?" for _ in ks)
+                    rows = conn.execute(
+                        "SELECT k, op, vt, vi, vb FROM ("
+                        "  SELECT k, MAX(seq) AS mseq, op, vt, vi, vb FROM kv"
+                        "  WHERE tenant=? AND k IN (" + qmarks + ")"
+                        "    AND seq < ? GROUP BY k)",
+                        [tenant] + ks + [seq]).fetchall()
+                finally:
+                    conn.close()
+                for k, op_, vt, vi, vb in rows:
+                    if op_ == "put":
+                        prior[tenant][str(k)] = common.value_to_wire(
+                            (vt, vi, vb))
+        return prior
+
+    @staticmethod
+    def _view_gkey(tenant, text):
+        return (tenant, "N" if text is None else "S",
+                "" if text is None else text)
+
+    @staticmethod
+    def _view_apply(acc, tenant, text, delta_rows, delta_ncnt, delta_sum):
+        """Accumulate one *delta* in a local {(tenant,tag,text): [n,ncnt,sum]}.
+
+        Deltas are never normalized here: a commit may move a row out of a
+        group and another row in, leaving a zero row-delta but a non-zero
+        integer delta that must still be applied.  Absolute totals (where an
+        empty group carries zero integer values) are normalized in
+        `_view_advance`."""
+        key = Server._view_gkey(tenant, text)
+        ent = acc.get(key)
+        if ent is None:
+            ent = acc[key] = [0, 0, 0]
+        ent[0] += delta_rows
+        ent[1] += delta_ncnt
+        ent[2] += delta_sum
+
+    def _view_fold_ops(self, prior, ops, acc):
+        """Fold one commit's ops into a tenant->group accumulator, in caller
+        order.  Only the net effect of a key's repeated ops in one commit is
+        charged: the captured old value moves out and the value left by the
+        last op moves in (put) or just the old value moves out (delete).  A
+        delete of a missing key therefore changes nothing."""
+        last = {}
+        for op in ops:
+            last[(op[1], op[2])] = op
+        for (tenant, key), op in last.items():
+            pv = prior.get(tenant, {}).get(str(key))
+            old = None if pv is None else (pv["t"], pv["i"])
+            if op[0] == "put":
+                new = (op[3][0], op[3][1])
+            else:
+                new = None
+            if old == new:
+                continue
+            # every live row counts toward the group's row count; only a
+            # non-NULL integer contributes to the non-null count and sum
+            if old is not None:
+                old_i = old[1]
+                if old_i is None:
+                    self._view_apply(acc, tenant, old[0], -1, 0, 0)
+                else:
+                    self._view_apply(acc, tenant, old[0], -1, -1, -int(old_i))
+            if new is not None:
+                new_i = new[1]
+                if new_i is None:
+                    self._view_apply(acc, tenant, new[0], 1, 0, 0)
+                else:
+                    self._view_apply(acc, tenant, new[0], 1, 1, int(new_i))
+
+    def _view_advance(self, c, view, gen, seq, deltas):
+        """Append cumulative versions for one commit boundary.  `deltas` maps
+        (tenant, tag, text) -> (drows, dncnt, dsum); groups whose delta is
+        zero are skipped, so history grows with changed groups only."""
+        pending = {k: v for k, v in deltas.items()
+                   if v[0] or v[1] or v[2]}
+        if not pending:
+            return
+        rows = c.execute(
+            "SELECT g.tenant, g.txt_null, g.txt, g.cnt, g.ncnt, g.total"
+            " FROM view_groups g JOIN ("
+            "  SELECT tenant, txt_null, txt, MAX(seq) AS mseq FROM view_groups"
+            "  WHERE view=? AND gen=? GROUP BY tenant, txt_null, txt"
+            " ) m ON g.tenant=m.tenant AND g.txt_null=m.txt_null"
+            "  AND g.txt=m.txt AND g.seq=m.mseq AND g.view=? AND g.gen=?",
+            (view, gen, view, gen)).fetchall()
+        cur = {(t, tn, tx): (cnt, ncnt, int(total))
+               for t, tn, tx, cnt, ncnt, total in rows}
+        ins = []
+        for key, (drows, dncnt, dsum) in pending.items():
+            base = cur.get(key, (0, 0, 0))
+            nrows = base[0] + drows
+            ncnt = base[1] + dncnt
+            total = base[2] + dsum
+            if nrows == 0:
+                ncnt = total = 0
+            ins.append((view, gen, key[0], key[1], key[2], seq,
+                        nrows, ncnt, str(total)))
+        c.executemany(
+            "INSERT OR REPLACE INTO view_groups"
+            "(view,gen,tenant,txt_null,txt,seq,cnt,ncnt,total)"
+            " VALUES (?,?,?,?,?,?,?,?,?)", ins)
+
+    def _view_epoch_at(self, c, seq):
+        """Routing epoch that was live at committed seq `seq`."""
+        row = c.execute(
+            "SELECT MAX(epoch) FROM epoch_meta WHERE active_from_seq<=?",
+            (seq,)).fetchone()
+        if row is None or row[0] is None:
+            return self._meta_int(c, "epoch")
+        return int(row[0])
+
+    def _view_row(self, c, name):
+        return c.execute(
+            "SELECT active_gen, start_seq, created_seq FROM views WHERE name=?",
+            (name,)).fetchone()
+
+    def _view_gen_row(self, c, view, gen):
+        return c.execute(
+            "SELECT start_seq, epoch, pin_token, scan_done, scan_t, scan_k,"
+            " agg_seq, phase, error FROM view_generations"
+            " WHERE view=? AND gen=?", (view, gen)).fetchone()
+
+    def _view_ready_info(self, c, name):
+        """Status of the active generation, raising VIEW_NOT_READY until it is
+        fully built and swapped in.  Never reports a half-built generation as
+        queryable."""
+        row = self._view_row(c, name)
+        if row is None:
+            raise StoreError("NO_VIEW", f"unknown view {name!r}")
+        active_gen, start_seq, created_seq = row
+        visible = self._meta_int(c, "visible_seq")
+        gen_rows = c.execute(
+            "SELECT gen, start_seq, epoch, phase, agg_seq, scan_done, error,"
+            " pin_token FROM view_generations WHERE view=? ORDER BY gen",
+            (name,)).fetchall()
+        gens = []
+        active = None
+        for (gen, gstart, gepoch, phase, agg_seq, scan_done, error,
+             pin) in gen_rows:
+            materialized = phase == "READY" and bool(scan_done)
+            gens.append({
+                "gen": gen, "start_seq": gstart, "epoch": gepoch,
+                "phase": phase, "agg_seq": agg_seq,
+                "scan_done": bool(scan_done),
+                "materialized": materialized, "error": error,
+                "is_active": gen == active_gen,
+            })
+            if gen == active_gen:
+                active = {"gen": gen, "start_seq": gstart, "agg_seq": agg_seq,
+                          "materialized": materialized, "phase": phase}
+        if active is None or not active["materialized"]:
+            detail = {"generations": gens}
+            if active is not None and active["phase"] == "FAILED":
+                # a failed generation never materializes: report it at once
+                detail["permanent"] = True
+                detail["phase"] = "FAILED"
+            raise StoreError(
+                "VIEW_NOT_READY",
+                f"view {name!r} active generation {active_gen} is not ready",
+                detail)
+        return {
+            "name": name, "active_gen": active_gen,
+            "start_seq": active["start_seq"], "created_seq": created_seq,
+            "visible_seq": visible,
+            "build_watermark": active["agg_seq"],
+            "queryable_lo": active["start_seq"],
+            "queryable_hi": active["agg_seq"],
+            "generations": gens,
+        }
+
+    def handle_view_create(self, name, start_seq, rebuild=False):
+        if not isinstance(name, str) or not name:
+            raise StoreError("BAD_REQUEST", "view name must be non-empty")
+        if not isinstance(start_seq, int) or isinstance(start_seq, bool):
+            raise StoreError("BAD_REQUEST", "start_seq must be an integer")
+        with self.commit_lock:
+            c = self._control()
+            try:
+                visible = self._meta_int(c, "visible_seq")
+                if start_seq < 0 or start_seq > visible:
+                    raise StoreError(
+                        "OUT_OF_RANGE",
+                        f"view start_seq {start_seq} is not a committed seq in"
+                        f" [0, {visible}]",
+                        {"min_start_seq": 0, "max_start_seq": visible})
+                row = self._view_row(c, name)
+                if row is not None and not rebuild:
+                    raise StoreError(
+                        "VIEW_EXISTS",
+                        f"view {name!r} already exists; rebuild to start a new"
+                        f" generation")
+                if row is None:
+                    next_gen = 1
+                else:
+                    next_gen = 1 + c.execute(
+                        "SELECT MAX(gen) FROM view_generations WHERE view=?",
+                        (name,)).fetchone()[0]
+                epoch = self._view_epoch_at(c, start_seq)
+                c.execute(
+                    "INSERT INTO view_generations(view,gen,start_seq,epoch,"
+                    "pin_token,scan_done,scan_t,scan_k,agg_seq,phase,error,"
+                    "created_seq) VALUES (?,?,?,?,NULL,0,NULL,NULL,?,"
+                    "'BUILDING',NULL,?)",
+                    (name, next_gen, start_seq, epoch, start_seq, visible))
+                if row is None:
+                    c.execute(
+                        "INSERT INTO views(name,active_gen,start_seq,created_seq)"
+                        " VALUES (?,?,?,?)",
+                        (name, next_gen, start_seq, visible))
+                c.commit()
+            finally:
+                c.close()
+        self._start_view_worker(name, next_gen)
+        return self._view_status_or_building(name)
+
+    def _view_status_or_building(self, name):
+        """Status for a just-created view: report the definition even while
+        the first generation is still building (no active result yet)."""
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._view_row(c, name)
+                if row is None:
+                    raise StoreError("NO_VIEW", f"unknown view {name!r}")
+                active_gen, start_seq, created_seq = row
+                visible = self._meta_int(c, "visible_seq")
+                gen_rows = c.execute(
+                    "SELECT gen, start_seq, epoch, phase, agg_seq, scan_done,"
+                    " error FROM view_generations WHERE view=? ORDER BY gen",
+                    (name,)).fetchall()
+                gens = [{"gen": g, "start_seq": gs, "epoch": ge, "phase": ph,
+                         "agg_seq": ag, "scan_done": bool(sd),
+                         "materialized": ph == "READY" and bool(sd),
+                         "error": er, "is_active": g == active_gen}
+                        for (g, gs, ge, ph, ag, sd, er) in gen_rows]
+                active = next((x for x in gens if x["gen"] == active_gen), None)
+                ready = bool(active and active["materialized"])
+                return {
+                    "name": name, "active_gen": active_gen,
+                    "start_seq": active["start_seq"] if active else start_seq,
+                    "created_seq": created_seq,
+                    "visible_seq": visible,
+                    "build_watermark": active["agg_seq"] if ready else None,
+                    "queryable_lo": active["start_seq"] if ready else None,
+                    "queryable_hi": active["agg_seq"] if ready else None,
+                    "ready": ready, "generations": gens,
+                }
+            finally:
+                c.close()
+
+    def handle_view_rebuild(self, name, start_seq=None):
+        with self.commit_lock:
+            c = self._control()
+            try:
+                row = self._view_row(c, name)
+            finally:
+                c.close()
+        if row is None:
+            raise StoreError("NO_VIEW", f"unknown view {name!r}")
+        if start_seq is None:
+            start_seq = row[1]
+        return self.handle_view_create(name, start_seq, rebuild=True)
+
+    def _start_view_worker(self, name, gen):
+        key = (name, gen)
+        with self.inflight_lock:
+            if key in self._view_workers:
+                return
+            self._view_workers.add(key)
+        threading.Thread(target=self._view_worker, args=(name, gen),
+                         name=f"view-{name}-{gen}", daemon=True).start()
+
+    def _stop_view_worker(self, name, gen):
+        with self.inflight_lock:
+            self._view_workers.discard((name, gen))
+
+    def _view_worker(self, name, gen):
+        try:
+            with self.commit_lock:
+                c = self._control()
+                try:
+                    grow = self._view_gen_row(c, name, gen)
+                finally:
+                    c.close()
+            if grow is None:
+                return
+            start_seq, epoch, _pin, scan_done, scan_t, scan_k, agg_seq, phase, \
+                _err = grow
+            if phase not in ("BUILDING", "CATCHING_UP", "READY"):
+                return
+            if not scan_done:
+                self._view_scan(name, gen, start_seq)
+            self._view_catchup(name, gen)
+        except Exception as e:  # noqa: BLE001 - record, never publish partial
+            traceback.print_exc()
+            try:
+                with self.commit_lock:
+                    c = self._control()
+                    try:
+                        c.execute(
+                            "UPDATE view_generations SET phase='FAILED',"
+                            " error=? WHERE view=? AND gen=? AND phase IN"
+                            " ('BUILDING','CATCHING_UP')",
+                            (repr(e), name, gen))
+                        c.commit()
+                    finally:
+                        c.close()
+            except Exception:
+                traceback.print_exc()
+        finally:
+            self._stop_view_worker(name, gen)
+
+    def _view_scan(self, name, gen, start_seq):
+        """Establish the aggregate at start_seq without depending on MVCC
+        retention: read the *current* committed state, back out every commit
+        after start_seq using its captured before-values, then fold the
+        result in bounded pages.  A scan always runs to completion; a crash
+        resumes by redoing it from the start (the staged rows are connection
+        local and the base aggregate is cleared first), so progress only ever
+        names a fully included commit boundary.
+
+        The initial read uses the *current* routing epoch: build_seq is the
+        current committed end, and a published split retires the old source (it
+        stops receiving writes), so only the live epoch holds the complete
+        state at build_seq.  The reverse-undo step only needs log records, not
+        historical routing, so the state at start_seq is recovered correctly
+        regardless of how many splits happened in between."""
+        with self.commit_lock:
+            c = self._control()
+            try:
+                build_seq = self._meta_int(c, "visible_seq")
+                scan_epoch = self._meta_int(c, "epoch")
+                routes = self._routes(c, scan_epoch)
+                token = "rt" + secrets.token_hex(12)
+                c.execute("INSERT INTO tokens(token_id,epoch,read_seq,released)"
+                          " VALUES (?,?,?,0)", (token, scan_epoch, build_seq))
+                c.execute("UPDATE view_generations SET pin_token=?"
+                          " WHERE view=? AND gen=?", (token, name, gen))
+                if start_seq == 0:
+                    # the state before any commit is empty: nothing to read or
+                    # back out, so the base aggregate is trivially established
+                    c.execute("DELETE FROM view_groups WHERE view=? AND gen=?",
+                              (name, gen))
+                    c.execute("UPDATE view_generations SET scan_done=1,"
+                              " agg_seq=0, scan_t=NULL, scan_k=NULL"
+                              " WHERE view=? AND gen=?", (name, gen))
+                c.commit()
+            finally:
+                c.close()
+        if start_seq == 0:
+            try:
+                self.handle_release(token)
+            except Exception:
+                traceback.print_exc()
+            self._checkpoint("after_view_scan")
+            # an injected failure must be observable on every scan path,
+            # including the trivially-empty start
+            self._check_view_fail()
+            return
+        try:
+            # stage the reversed ("state at start_seq") rows on disk in the
+            # control database so the working set never has to fit in memory
+            c = self._control()
+            c.execute("CREATE TEMP TABLE IF NOT EXISTS view_undo ("
+                      "  tenant TEXT NOT NULL, k INTEGER NOT NULL,"
+                      "  op TEXT NOT NULL, vt TEXT, vi INTEGER, pb BLOB,"
+                      "  PRIMARY KEY (tenant, k))")
+            c.execute("DELETE FROM temp.view_undo")
+            # a scan that never finished leaves only partial aggregate rows at
+            # start_seq with scan_done=0; discard them and rebuild from the
+            # top.  agg_seq only advances after scan_done is set, so no commit
+            # boundary is ever half-included and progress always corresponds
+            # to a fully included boundary.
+            c.execute("DELETE FROM view_groups WHERE view=? AND gen=?",
+                      (name, gen))
+            c.execute("UPDATE view_generations SET agg_seq=start_seq,"
+                      " scan_t=NULL, scan_k=NULL WHERE view=? AND gen=?",
+                      (name, gen))
+            c.commit()
+            # 1) current live rows (as of build_seq)
+            for sid, rlo, rhi in routes:
+                cur = None
+                while True:
+                    batch = self._shard_scan(sid, build_seq, rlo, False, rhi,
+                                             self.batch_size) if cur is None else \
+                        self._shard_scan(sid, build_seq, cur, True, rhi,
+                                         self.batch_size)
+                    if not batch:
+                        break
+                    c.executemany(
+                        "INSERT OR REPLACE INTO temp.view_undo"
+                        "(tenant,k,op,vt,vi,pb) VALUES (?,?,'put',?,?,?)",
+                        [(t, k, vt, vi, vb) for (t, k, (vt, vi, vb)) in batch])
+                    c.commit()
+                    cur = (batch[-1][0], batch[-1][1])
+            # 2) undo commits build_seq..start_seq+1 in descending order.  A
+            #    commit's prior holds the committed value of each touched key
+            #    just before it; restoring that value (or removing the key
+            #    when there was none) recovers the state before the commit.
+            for seq in range(build_seq, start_seq, -1):
+                row = c.execute("SELECT deliver_json, prior_json FROM commits"
+                                " WHERE seq=?", (seq,)).fetchone()
+                if row is None:
+                    raise StoreError(
+                        "VIEW_BUILD_FAILED",
+                        f"no durable record for commit {seq}; cannot rebuild"
+                        f" the state at {start_seq}")
+                djson, pjson = row
+                if djson is None or pjson is None:
+                    raise StoreError(
+                        "VIEW_BUILD_FAILED",
+                        f"commit {seq} has no retained before-values; build"
+                        f" view {name!r} from a later start_seq")
+                prior = json.loads(pjson)
+                # ops in the payload are wire dicts; collect (tenant,key)
+                keys = set()
+                for o in json.loads(djson)["ops"]:
+                    keys.add((o["tenant"], int(o["key"])))
+                for (t, k) in keys:
+                    pv = prior.get(t, {}).get(str(k))
+                    if pv is None:
+                        c.execute("DELETE FROM temp.view_undo"
+                                  " WHERE tenant=? AND k=?", (t, k))
+                    else:
+                        c.execute(
+                            "INSERT OR REPLACE INTO temp.view_undo"
+                            "(tenant,k,op,vt,vi,pb) VALUES (?,?,'put',?,?,?)",
+                            (t, k, pv["t"], None if pv["i"] is None
+                             else int(pv["i"]),
+                             None if pv["b"] is None
+                             else common.b64d(pv["b"])))
+                c.commit()
+                self._checkpoint("during_view_build")
+                self._check_view_fail()
+            # 3) fold the staged rows into the aggregate in bounded pages.  The
+            #    staging table lives only for this connection, so a scan is
+            #    always folded from the start; the base aggregate was just
+            #    cleared above, which keeps resumption after a crash exact.
+            cursor = None
+            while True:
+                sql = ("SELECT tenant, k, vt, vi FROM temp.view_undo")
+                params = []
+                if cursor is not None:
+                    sql += " WHERE (tenant, k) > (?, ?)"
+                    params.extend([cursor[0], cursor[1]])
+                sql += " ORDER BY tenant, k LIMIT ?"
+                params.append(self.batch_size)
+                page = c.execute(sql, params).fetchall()
+                if not page:
+                    break
+                deltas = {}
+                for tenant, _k, vt, vi in page:
+                    if vi is None:
+                        self._view_apply(deltas, tenant, vt, 1, 0, 0)
+                    else:
+                        self._view_apply(deltas, tenant, vt, 1, 1, int(vi))
+                self._view_advance(c, name, gen, start_seq,
+                                   {k: tuple(v) for k, v in deltas.items()})
+                cursor = (page[-1][0], page[-1][1])
+                c.execute("UPDATE view_generations SET scan_t=?,scan_k=?"
+                          " WHERE view=? AND gen=?",
+                          (cursor[0], cursor[1], name, gen))
+                c.commit()
+                self._checkpoint("during_view_fold")
+                self._check_view_fail()
+            c.execute("DELETE FROM temp.view_undo")
+            c.execute("UPDATE view_generations SET scan_done=1,"
+                      " scan_t=NULL, scan_k=NULL WHERE view=? AND gen=?",
+                      (name, gen))
+            c.commit()
+            self._checkpoint("after_view_scan")
+        finally:
+            c.close()
+            # the scan is over: the pin and the staged table are no longer
+            # needed (release is idempotent, and recovery also clears it)
+            try:
+                self.handle_release(token)
+            except Exception:
+                traceback.print_exc()
+
+    def _view_ops_for_commit(self, c, seq):
+        """(decoded ops, captured prior) for commit `seq`, or None when it
+        cannot be folded exactly (prior capture absent)."""
+        row = c.execute(
+            "SELECT deliver_json, prior_json, applied FROM commits WHERE seq=?",
+            (seq,)).fetchone()
+        if row is None or not row[2]:
+            raise StoreError("INTERNAL", f"commit {seq} missing or unapplied")
+        deliver_json, prior_json = row[0], row[1]
+        if deliver_json is None or prior_json is None:
+            return None
+        return ([common.op_from_wire(o) for o in json.loads(deliver_json)["ops"]],
+                json.loads(prior_json))
+
+    def _view_catchup(self, name, gen):
+        """Fold commits in seq order, advancing agg_seq in the same control
+        transaction as each commit's aggregate version.  Only fully applied
+        commits are folded, so a partially applied cross-shard transaction is
+        never half counted.  While the generation is BUILDING it publishes as
+        soon as it reaches the live committed end; once READY it keeps tailing
+        new commits so the view stays exact at every later watermark, without
+        ever answering ahead of what it has materialized."""
+        while not self.shutdown_flag.is_set():
+            with self.commit_lock:
+                c = self._control()
+                try:
+                    grow = self._view_gen_row(c, name, gen)
+                    if grow is None or grow[7] == "FAILED":
+                        return
+                    agg_seq, phase = grow[6], grow[7]
+                    visible = self._meta_int(c, "visible_seq")
+                    nxt = None
+                    if agg_seq < visible:
+                        r = c.execute("SELECT applied FROM commits WHERE seq=?",
+                                      (agg_seq + 1,)).fetchone()
+                        if r is not None and r[0]:
+                            nxt = agg_seq + 1  # fully applied: fold it
+                    if nxt is None:
+                        if phase != "READY" and agg_seq >= visible:
+                            # initial build reached the committed end: the
+                            # first generation becomes visible atomically
+                            self._checkpoint("before_view_publish")
+                            c.execute(
+                                "UPDATE view_generations SET phase='READY'"
+                                " WHERE view=? AND gen=?", (name, gen))
+                            c.execute("UPDATE views SET active_gen=?"
+                                      " WHERE name=?", (gen, name))
+                            c.commit()
+                            self._checkpoint("after_view_publish")
+                            # continue as a tailer
+                            continue
+                        if phase != "READY":
+                            c.execute(
+                                "UPDATE view_generations SET phase='CATCHING_UP'"
+                                " WHERE view=? AND gen=?", (name, gen))
+                            c.commit()
+                        nxt = "wait"
+                    else:
+                        ops_prior = self._view_ops_for_commit(c, nxt)
+                        if ops_prior is None:
+                            raise StoreError(
+                                "VIEW_BUILD_FAILED",
+                                f"commit {nxt} has no retained before-values;"
+                                f" build view {name!r} from a later start_seq")
+                        ops, prior = ops_prior
+                        acc = {}
+                        self._view_fold_ops(prior, ops, acc)
+                        self._view_advance(c, name, gen, nxt,
+                                           {k: tuple(v) for k, v in
+                                            acc.items()})
+                        c.execute("UPDATE view_generations SET agg_seq=?"
+                                  " WHERE view=? AND gen=?", (nxt, name, gen))
+                        c.commit()
+                        self._checkpoint("during_view_catchup")
+                finally:
+                    c.close()
+            if nxt == "wait":
+                time.sleep(0.02)
+
+    def handle_view_status(self, name):
+        with self.commit_lock:
+            c = self._control()
+            try:
+                return self._view_ready_info(c, name)
+            finally:
+                c.close()
+
+    def handle_view_state(self, name):
+        """Definition/build status, including when the active generation is
+        still building (unlike query/status readiness)."""
+        return self._view_status_or_building(name)
+
+    def handle_views(self):
+        out = []
+        with self.commit_lock:
+            c = self._control()
+            try:
+                names = [r[0] for r in c.execute(
+                    "SELECT name FROM views ORDER BY name").fetchall()]
+            finally:
+                c.close()
+        for n in names:
+            try:
+                out.append(self.handle_view_status(n))
+            except StoreError as e:
+                if e.code != "VIEW_NOT_READY":
+                    raise
+                out.append(self._view_status_or_building(n))
+        return {"views": out}
+
+    def handle_view_query(self, name, watermark=None, lo=None, hi=None,
+                          wait=True, timeout_ms=30000):
+        """Answer exactly at `watermark` (default: the active build
+        watermark).  If it is not yet materialized, wait up to timeout_ms;
+        then fail with VIEW_NOT_READY instead of silently answering at another
+        watermark."""
+        if watermark is not None and (not isinstance(watermark, int)
+                                     or isinstance(watermark, bool)):
+            raise StoreError("BAD_REQUEST", "watermark must be an integer")
+        start_t = time.time()
+        last = None
+        while True:
+            with self.commit_lock:
+                c = self._control()
+                try:
+                    row = self._view_row(c, name)
+                    if row is None:
+                        raise StoreError("NO_VIEW", f"unknown view {name!r}")
+                    st = self._view_ready_info(c, name)
+                    target = (st["build_watermark"] if watermark is None
+                              else watermark)
+                    if target < st["queryable_lo"]:
+                        # below the generation's start there is no aggregate and
+                        # never will be: waiting cannot help -> refuse at once
+                        raise StoreError(
+                            "VIEW_NOT_READY",
+                            f"view {name!r} starts at {st['queryable_lo']};"
+                            f" watermark {target} predates it",
+                            {"queryable_lo": st["queryable_lo"],
+                             "queryable_hi": st["queryable_hi"],
+                             "build_watermark": st["build_watermark"],
+                             "watermark": target, "permanent": True})
+                    if target > st["queryable_hi"]:
+                        # beyond the committed end, or a commit the tailer has
+                        # not folded yet: may become available by waiting
+                        raise StoreError(
+                            "VIEW_NOT_READY",
+                            f"view {name!r} has no materialized aggregate at"
+                            f" watermark {target} (available"
+                            f" [{st['queryable_lo']}, {st['queryable_hi']}])",
+                            {"queryable_lo": st["queryable_lo"],
+                             "queryable_hi": st["queryable_hi"],
+                             "build_watermark": st["build_watermark"],
+                             "watermark": target})
+                    groups = self._view_query_rows(
+                        c, name, st["active_gen"], target, lo, hi)
+                    return {"name": name, "gen": st["active_gen"],
+                            "watermark": target,
+                            "queryable_lo": st["queryable_lo"],
+                            "queryable_hi": st["queryable_hi"],
+                            "groups": groups}
+                except StoreError as e:
+                    if e.code != "VIEW_NOT_READY":
+                        raise
+                    last = e
+                    if e.detail and e.detail.get("permanent"):
+                        raise  # cannot become available by waiting
+                finally:
+                    c.close()
+            if not wait or (time.time() - start_t) * 1000 >= timeout_ms:
+                raise StoreError(
+                    "VIEW_NOT_READY",
+                    f"view {name!r} is not ready at watermark {watermark}"
+                    f" (waited {int((time.time() - start_t) * 1000)} ms)",
+                    last.detail if last is not None else {"watermark": watermark})
+            time.sleep(0.02)
+
+    def _view_query_rows(self, c, name, gen, watermark, lo, hi):
+        """Latest cumulative version per group at or below `watermark`,
+        filtered by the optional (tenant, text) key range, in stable order."""
+        sql = ("SELECT g.tenant, g.txt_null, g.txt, g.cnt, g.ncnt, g.total"
+               " FROM view_groups g JOIN ("
+               "   SELECT tenant, txt_null, txt, MAX(seq) AS mseq"
+               "   FROM view_groups WHERE view=? AND gen=? AND seq<=?"
+               "   GROUP BY tenant, txt_null, txt"
+               " ) m ON g.tenant=m.tenant AND g.txt_null=m.txt_null"
+               "   AND g.txt=m.txt AND g.seq=m.mseq AND g.view=? AND g.gen=?")
+        params = [name, gen, watermark, name, gen]
+        conds = []
+        if lo is not None:
+            conds.append("(g.tenant, g.txt_null, g.txt) >= (?, ?, ?)")
+            params.extend(self._view_gkey(lo[0], lo[1]))
+        if hi is not None:
+            conds.append("(g.tenant, g.txt_null, g.txt) < (?, ?, ?)")
+            params.extend(self._view_gkey(hi[0], hi[1]))
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        sql += " ORDER BY g.tenant, g.txt_null, g.txt"
+        out = []
+        for tenant, tn, txt, cnt, ncnt, total in c.execute(sql, params):
+            if cnt <= 0:
+                continue  # an emptied group has disappeared
+            out.append({"tenant": tenant,
+                        "text": None if tn == "N" else txt,
+                        "rows": int(cnt),
+                        "int_nonnull": int(ncnt),
+                        "int_sum": total})
+        return out
+
     # ------------------------------------------------------------ split
     def handle_split(self, shard_id, bt, bk):
         try:
@@ -1312,6 +2156,10 @@ class Server:
                 (new_epoch, right_id, bt, bk,
                  src[2][0] if src[2] else None, src[2][1] if src[2] else None))
             c.execute("UPDATE meta SET v=? WHERE k='epoch'", (str(new_epoch),))
+            # record when this epoch became live so a historical commit seq
+            # maps to the routing that was actually in service then
+            c.execute("INSERT OR REPLACE INTO epoch_meta(epoch,active_from_seq)"
+                      " VALUES (?,?)", (new_epoch, visible + 1))
             c.execute("UPDATE shards SET state='retired' WHERE shard_id=?", (source,))
             c.execute("UPDATE shards SET state='active' WHERE shard_id IN (?,?)",
                       (left_id, right_id))
@@ -1705,6 +2553,11 @@ class Server:
             self.copy_paused.clear()
         return {"paused": bool(on)}
 
+    def handle_test_view_fail(self, on):
+        """Arm a one-shot view build failure (test hook)."""
+        self.view_fail_armed = bool(on)
+        return {"armed": bool(on)}
+
     def handle_shutdown(self):
         self.shutdown_flag.set()
         return {"bye": True}
@@ -1743,6 +2596,8 @@ class Server:
             return self.handle_test_arm_crash(args["point"])
         if op == "test_pause_copy":
             return self.handle_test_pause_copy(bool(args["on"]))
+        if op == "test_view_fail":
+            return self.handle_test_view_fail(bool(args["on"]))
         # ---------------------------------------------------- subscriptions
         if op == "subscribe":
             return self.handle_subscribe(args["name"], int(args["after_seq"]))
@@ -1777,6 +2632,25 @@ class Server:
         if op == "snapshot_restore":
             return self.handle_snapshot_restore(args["backup_path"],
                                                 args["target_dir"])
+        # ---------------------------------------------------- grouped views
+        if op == "view_create":
+            return self.handle_view_create(args["name"],
+                                           int(args["start_seq"]))
+        if op == "view_rebuild":
+            ss = args.get("start_seq")
+            return self.handle_view_rebuild(args["name"],
+                                            None if ss is None else int(ss))
+        if op == "view_status":
+            return self.handle_view_state(args["name"])
+        if op == "views":
+            return self.handle_views()
+        if op == "view_query":
+            return self.handle_view_query(
+                args["name"], args.get("watermark"),
+                _parse_text_bound(args.get("lo")),
+                _parse_text_bound(args.get("hi")),
+                bool(args.get("wait", True)),
+                int(args.get("timeout_ms", 30000)))
         raise StoreError("BAD_REQUEST", f"unknown op {op!r}")
 
     def _handle_conn(self, conn):
@@ -1833,6 +2707,13 @@ def _parse_bound(b):
     if b is None:
         return None
     return (b["tenant"], int(b["key"]))
+
+
+def _parse_text_bound(b):
+    """A view key bound is (tenant, text|None); None text is its own group."""
+    if b is None:
+        return None
+    return (b["tenant"], b.get("text"))
 
 
 def main(argv=None):

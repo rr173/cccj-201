@@ -331,9 +331,68 @@ class Store:
     def shutdown(self):
         return self._rpc("shutdown")
 
+    # ---------------------------------------------------------- grouped views
+    def view_create(self, name, start_seq):
+        """Create a persistent grouped aggregate view of (tenant, text).
+
+        The view's initial state is the logical row state at the committed
+        seq `start_seq`; writes committed while it is being built are folded
+        in before its first generation becomes queryable.  Each group reports
+        the row count, the number of non-NULL integers and their exact sum
+        (an arbitrary-precision decimal string, never a 64-bit wraparound).
+        Raises VIEW_EXISTS if the name already exists; use view_rebuild."""
+        return self._rpc("view_create", name=name, start_seq=int(start_seq))
+
+    def view_rebuild(self, name, start_seq=None):
+        """Build a fresh generation for `name` from `start_seq` (default: the
+        view's original start_seq).  The previous generation stays fully
+        queryable during the rebuild; the swap to the new one is atomic, so a
+        caller sees a complete old or a complete new result."""
+        args = {"name": name}
+        if start_seq is not None:
+            args["start_seq"] = int(start_seq)
+        return self._rpc("view_rebuild", **args)
+
+    def view_status(self, name):
+        """Definition, build progress and queryable watermark range of a view
+        (works while the first generation is still building)."""
+        return self._rpc("view_status", name=name)
+
+    def views(self):
+        return self._rpc("views")
+
+    def view_query(self, name, watermark=None, lo=None, hi=None, wait=True,
+                   timeout_ms=30000):
+        """Grouped rows of view `name` exactly at committed seq `watermark`
+        (default: the active generation's build watermark).
+
+        `lo`/`hi` are half-open (tenant, text|None) bounds; NULL is its own
+        group and sorts before every non-NULL text.  If the requested
+        watermark is not yet materialized the call waits up to `timeout_ms`
+        and then raises VIEW_NOT_READY (code) rather than answering at a
+        different, older watermark.  `groups` are ordered stably by
+        (tenant UTF-8, NULL-before-text, text)."""
+        def enc(b):
+            return None if b is None else {"tenant": b[0], "text": b[1]}
+        return self._rpc("view_query", name=name, watermark=watermark,
+                         lo=enc(lo), hi=enc(hi), wait=bool(wait),
+                         timeout_ms=int(timeout_ms))
+
+    def view_wait_ready(self, name, watermark=None, timeout_ms=60000):
+        """Block until the view can answer at `watermark` (or its current
+        build watermark when omitted) and return that query result.  Raises
+        VIEW_NOT_READY on timeout or when the watermark is unreachable."""
+        return self.view_query(name, watermark=watermark, lo=None, hi=None,
+                               wait=True, timeout_ms=timeout_ms)
+
     # ---------------------------------------------------------- test hooks
     def pause_copy(self, on):
         return self._rpc("test_pause_copy", on=bool(on))
 
     def arm_crash(self, point):
         return self._rpc("test_arm_crash", point=point)
+
+    def arm_view_failure(self, on=True):
+        """Test hook: make the next view build generation fail, proving the
+        previous generation stays queryable."""
+        return self._rpc("test_view_fail", on=bool(on))

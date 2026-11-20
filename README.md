@@ -20,7 +20,8 @@
 ```
 <dir>/
   control.sqlite     路由纪元、提交决定日志（含变更载荷：既是恢复依据
-                     也是变更订阅日志）、订阅游标/世代、读令牌、split 状态机
+                     也是变更订阅日志）、每提交的按键“旧值”捕获、订阅游标/
+                     世代、读令牌、split 状态机、分组汇总视图定义/世代/聚合
   shards/<id>.db     每个分片一个文件：kv(tenant,k,seq,op,vt,vi,vb) +
                      frontier(已应用提交前沿)
 ```
@@ -231,7 +232,57 @@ python3 -m shardstore.snapshot restore /backups/b1 /data/newstore
 `TARGET_NOT_EMPTY`。崩溃测试钩子见下文（`*_snapshot_*` /
 `*_restore_*` 点）。
 
-## 运行
+## 持久化分组汇总视图
+
+按 `(tenant, 可空文本)` 分组维护一份随提交推进的汇总：每组的**行数**、
+**整数列非空数**、**整数列总和**。视图定义、每个构建世代的聚合与处理进度
+都落在 `control.sqlite`，重启后一致。
+
+```python
+st = s.view_create("daily", start_seq=0)   # 从已提交序号 0 的逻辑行状态起建
+s.view_status("daily")                      # 定义、世代、进度、可查询水位范围
+q = s.view_query("daily")                   # 默认在活跃世代的构建水位上查询
+q = s.view_query("daily", watermark=42, lo=("acct", None), hi=("acct", "z"))
+q["groups"]   # [{"tenant","text","rows","int_nonnull","int_sum"}, ...]
+s.view_rebuild("daily", start_seq=0)        # 新一代重建，旧的持续可查
+```
+
+- **分组键与语义**：`(tenant, text)`；`text IS NULL` 是**独立分组**，排序上
+  排在非 NULL 文本之前。行数统计组内所有存活行；`int_nonnull` 只计整数列非
+  NULL 的行；`int_sum` 只加非 NULL 整数。**NULL 整数既不计非空数也不进总和**。
+  组变为空（行数 0）时从结果中消失。结果按 `(tenant UTF-8 字节序, NULL 先,
+  text 字节序)` **稳定排序**。
+- **精确求和**：总和以任意精度十进制字符串在服务端累积与返回，客户端
+  `int_sum` 也是字符串；**绝不回绕到有符号 64 位也不经浮点舍入**。行值更新
+  时从旧分组撤销旧贡献、再加入新分组；删除不存在的行不改变汇总；同一事务内
+  对同一键的多次操作按净效果计入。
+- **水位查询合同**：`view_query(name, watermark=W)` 只在**恰好 W** 上作答。
+  某个 W 尚未物化时等待（`wait=True`，`timeout_ms` 上限）直到可用，超时或
+  `wait=False` 返回明确的 `VIEW_NOT_READY`（附带可用范围），**绝不静默用旧
+  水位冒充**。可用范围是 `[活跃世代 start_seq, 已完整纳入的提交边界]`。
+- **如何与提交边界原子衔接**：提交路径在同一控制事务里写入决定记录以及每个
+  被触及键的**旧值捕获**（`commits.prior_json`，来自当前路由，跨分片与 split
+  后都正确）。视图建立先按当前分片状态建基线，再用这些旧值把 `start_seq` 之后
+  的提交**反向撤销**到起始点（证据来自持久日志，不依赖行版本保留）；随后按
+  `commit_seq` 顺序**异步追赶**，每个提交的聚合版本与它的 `agg_seq` 在**同一个
+  控制事务**内推进，因此进度总对应一个**已完整纳入的提交边界**。只有 `applied=1`
+  的提交可被折叠，跨分片事务不会被拆开只计一部分。重建失败（或崩溃恢复发现缺
+  少精确旧值）会把该世代标为 `FAILED`，**绝不发布半成品**。
+- **切换原子性**：新一代的聚合追平实时已提交末尾后，在一个控制事务里把该世代
+  标为 `READY` 并切换 `views.active_gen`；切换前/后调用者只看到完整旧版本或
+  完整新版本。重建期间旧世代持续可查询。
+- **重启**：定义、各世代状态（阶段、`agg_seq`、聚合版本）、可查询范围都在
+  控制库；崩溃时未完成的初始扫描会**从头重做该世代**（暂存表是连接级、随进程
+  消失，且基座聚合先清空重算），不会重复计数；已 `READY` 的世代重启后继续尾部
+  追赶新提交。
+- **与 split 无关**：查询按水位读累积版本，与路由纪元无关——`split` 前后查询
+  同一提交序号得到相同结果。
+- **构建内存有界**：初始状态反向撤销暂存于连接级磁盘临时表并按批折叠，聚合按
+  改变的组追加版本，内存与数据总量无关。
+
+`snapshot_export/restore` 不迁移视图（与订阅、令牌、split 状态一致，属于源实例
+的运行时状态）；恢复实例的 `visible_seq = watermark`，可在其上重新 `view_create`。
+
 
 ```bash
 # 启动服务（常驻，多进程经 unix socket 访问）
@@ -252,6 +303,11 @@ ONLY="cleanup and receipts" python3 subscription_acceptance.py
 python3 snapshot_acceptance.py
 SNAP_SCALE_ROWS=120000 python3 snapshot_acceptance.py
 ONLY="crash" python3 snapshot_acceptance.py
+
+# 分组汇总视图验收（每提交全量逻辑行模型自行求和，崩溃/重启/重建失败）
+python3 view_acceptance.py
+VIEW_SCALE_ROWS=120000 python3 view_acceptance.py
+ONLY="split" python3 view_acceptance.py
 ```
 
 ## 客户端 API 摘要
@@ -288,6 +344,14 @@ s.cleanup(100)                                      # 释放载荷，绝不越�
 rep = s.snapshot_export("/backups/b1")             # 水位/计数/键范围/段摘要
 s.snapshot_inspect("/backups/b1")                  # 离线校验 + 订阅恢复边界
 s.snapshot_restore("/backups/b1", "/data/new")     # 原子发布，绝不覆盖已有数据
+
+# 分组汇总视图（按 (tenant, text) 分组的行数 / 整数非空数 / 精确总和）
+s.view_create("daily", start_seq=0)                # 从已提交序号 0 起建
+s.view_status("daily")                             # 定义/世代/进度/可查询范围
+s.view_query("daily", watermark=42)                # 恰好 42，未就绪则 VIEW_NOT_READY
+s.view_query("daily", lo=("acct", None), hi=("acct", "z"))
+s.view_rebuild("daily", start_seq=0)               # 新一代，旧世代持续可查
+s.views()
 ```
 
 测试钩子（验收脚本使用）：`pause_copy(on)` 暂停/恢复拷贝线程（同步点），
@@ -297,8 +361,11 @@ s.snapshot_restore("/backups/b1", "/data/new")     # 原子发布，绝不覆盖
 `during_snapshot_segments`、`before_snapshot_manifest`、
 `after_snapshot_manifest`、`during_restore_verify`、
 `during_restore_build`、`before_restore_publish`、
-`after_restore_publish`）。段滚动阈值可用环境变量
-`SHARDSTORE_SEG_TARGET`（字节，>=1024）调小以演练多段备份。
+`after_restore_publish`）。视图构建的崩溃点：`during_view_build`、
+`after_view_scan`、`during_view_catchup`、`before_view_publish`、
+`after_view_publish`；`arm_view_failure(on)` 让下一次构建失败以验证旧世代仍可
+用。段滚动阈值可用环境变量 `SHARDSTORE_SEG_TARGET`（字节，>=1024）调小以演练
+多段备份。
 
 ## 验收覆盖
 
@@ -330,4 +397,14 @@ NULL/BLOB、拉取/确认/清理期间强制结束并重开、多进程争用同
 重复主键、乱序帧、缺失段与清单、空库、清理后仍保留的幂等回执、多个源
 分片映射到恢复布局、8MiB 超大单值，以及运行时生成大数据量的有界内存
 （RSS 采样）与多段滚动。
+
+`view_acceptance.py` 用**每提交保留全量逻辑行的独立字典模型**自行计算分组
+期望（不调用服务端聚合/SQL）：空视图、NULL 文本独立分组、整数 NULL 不计
+非空数/总和、负值、超 64 位精确总和、跨组更新、删除与删除不存在键、同键
+同事务多次操作、排序与键范围过滤；视图初始化/重建期间继续提交并执行两次
+真正跨分片的 split，核对各可用水位与 split 前后同一水位一致；用真实
+`os._exit` 在构建扫描、追赶、发布前后强制退出并重启，确认无遗漏、重复或
+部分事务暴露，且崩溃前的完整世代仍可用；注入重建失败确认旧世代完整可查；
+重启后定义/聚合/进度/可查询范围保持一致；并以运行时生成的大行集（RSS
+采样）验证扫描与构建分批有界内存。
 
